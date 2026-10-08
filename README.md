@@ -47,7 +47,7 @@ Probado con Claude Code 2.1.293.
 | Barra | De 0 a 1.000.000 de tokens, con los mismos colores. `●` es el punto actual y `┃` el umbral en el que se compacta |
 | `sesión: N` | Gasto acumulado de la sesión: entrada, salida y escritura de caché, subagentes incluidos. La caché leída no cuenta |
 | `CPU n% · RAM n%` | Uso de todo el equipo: media de las 5 últimas lecturas, una cada 12 segundos. Verde hasta 60 %, amarillo hasta 85 %, rojo por encima. Solo en Windows |
-| `Semana: n% usado` | Segunda línea: el límite semanal de tu plan (todos los modelos), con su barra bajo la de contexto y cuándo se renueva, en la hora de tu equipo. Mismos colores que CPU y RAM. Aparece con la primera respuesta de cada sesión y solo en planes de suscripción |
+| `Semana: n% usado` | Segunda línea: el límite semanal de tu plan, con su barra bajo la de contexto y cuándo se renueva, en la hora de tu equipo. Mismos colores que CPU y RAM. Si el modelo que estás usando tiene un límite semanal propio (como Fable), enseña ese, con su nombre: `Semana Fable: n% usado`; con los demás modelos, el de todos. Solo en planes de suscripción |
 
 En terminales estrechos las barras se encogen.
 
@@ -79,6 +79,10 @@ todas tus sesiones y proyectos.
   mientras dura la sesión. No modifica `settings.json`.
 - **Ficheros de resumen** en `.claude/resumenes/` del proyecto. Si no los quieres en
   tu repositorio, añade esa carpeta a `.gitignore`.
+- **Una consulta a Claude Code** (`claude -p /usage --safe-mode --no-session-persistence`) al
+  arrancar la sesión y, como mucho, cada 5 minutos: de ahí sale el límite semanal propio de cada
+  modelo. Tarda unos 3 segundos, no llama al modelo, no carga tus plugins ni servidores MCP y no
+  guarda sesión. Si tu plan no tiene límites por modelo, se hace una sola vez.
 - **Un `powershell.exe` oculto por sesión** (unos 85 MB) que lee el uso de CPU y RAM
   por WMI. Se cierra con la sesión. No sale nada del equipo: no hay red ni telemetría.
 
@@ -94,8 +98,9 @@ todas tus sesiones y proyectos.
 - El punto exacto de compactado sale de las reservas que usa el motor en la versión
   2.1.293. Si una versión posterior las cambia, la marca puede desviarse unos miles
   de tokens.
-- Del plan solo se enseña el límite semanal de todos los modelos: el semanal por modelo no
-  llega a los mods.
+- El límite de todos los modelos llega con la primera respuesta de cada sesión; el propio de un
+  modelo se lee del texto de `/usage` y puede ir hasta 5 minutos por detrás. Si una versión de
+  Claude Code cambia ese texto, la línea vuelve a enseñar el de todos los modelos.
 - CPU y RAM solo se muestran en Windows y en sesiones interactivas. En macOS y Linux
   el resto de la banda funciona igual.
 

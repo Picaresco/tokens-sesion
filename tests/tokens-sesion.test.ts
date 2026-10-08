@@ -65,6 +65,9 @@ const world = (
     reader: false,
     // Los límites del plan que el motor conoce: ninguno hasta la primera respuesta.
     limits: [] as SessionRateLimit[],
+    // El modelo del hilo principal, y lo que responde `claude -p /usage`: sin salida, no arranca.
+    model: 'claude-opus-5-5',
+    usageText: null as string | null,
   }
   // Lo que el lector va escribiendo, y cada vez que el mod lo lanzó.
   const pipe = {
@@ -72,6 +75,7 @@ const world = (
     wake: undefined as (() => void) | undefined,
   }
   const spawned: string[][] = []
+  const ran: string[][] = []
 
   on('process.spawn', async function* (_$, e) {
     spawned.push([...e.argv])
@@ -115,6 +119,20 @@ const world = (
     },
   }))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('session.model', () => ({ value: state.model }))
+  on('process.run', (_$, e) => {
+    ran.push([...e.argv])
+
+    return {
+      value: {
+        exitCode: state.usageText === null ? 1 : 0,
+        stdout: state.usageText ?? '',
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
   // Como el motor: compacta, lanza PostCompact con el resumen y devuelve lo que queda.
   on('session.compact', async (_$, e): Promise<SessionCompactResult> => {
     compacts.push(e)
@@ -165,6 +183,8 @@ const world = (
     toasts,
     registered,
     spawned,
+    ran,
+    clock,
     state,
     // Deja que el mod acabe lo que tenga entre manos.
     settle: () => clock.settle(),
@@ -189,7 +209,7 @@ const world = (
       const stream = $.turn.step({
         turnId: 't',
         index: state.index++,
-        model: 'test',
+        model: state.model,
         messageCount: 1,
         ...(agentId === undefined ? {} : { agentId }),
       })
@@ -548,6 +568,123 @@ test('con el límite semanal del plan añade una línea con su barra bajo la de 
   state.limits = week(80, RESETS)
   await start()
   expect((await band($, 'terminal')).week.label?.text).toBe('Semana:   80% usado ')
+})
+
+test('con un modelo que tiene su propio límite semanal enseña ese, y con los demás el de todos', async ($, on) => {
+  const { ask, clock, measure, ran, start, state } = world($, on)
+  const VERDE = '#22c55e'
+  const AMARILLO = '#facc15'
+  // Lo que imprime `claude -p /usage`, con el límite de todos los modelos y el propio de Fable.
+  const report = (fable: number, resets = 'Oct 9, 10pm') =>
+    [
+      'You are currently using your subscription to power your Claude Code usage',
+      '',
+      'Current session: 35% used · resets Oct 8, 5am (Europe/Madrid)',
+      'Current week (all models): 81% used · resets Oct 9, 10pm (Europe/Madrid)',
+      `Current week (Fable): ${fable}% used · resets ${resets} (Europe/Madrid)`,
+      '',
+      "What's contributing to your limits usage?",
+    ].join('\r\n')
+  const when = (date: Date) =>
+    ` · se renueva ${['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'][date.getDay()]} ${date.getDate()}, ` +
+    `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+
+  // Al arrancar pregunta a Claude Code, sin cargar nada del usuario ni guardar la sesión.
+  state.usageText = report(12)
+  state.limits = [{ kind: 'seven_day', percentUsed: 81, resetsAt: '2026-10-09T20:00:00.000Z' }]
+  await start()
+  await clock.settle()
+  expect(ran).toEqual([
+    ['claude', '-p', '/usage', '--safe-mode', '--no-session-persistence', '--model', 'haiku'],
+  ])
+
+  // Con un modelo sin límite propio, el de todos los modelos.
+  await ask(usage(222_807, 0, 0, 0))
+  await measure(222_807)
+  let drawn = await band($, 'terminal')
+  expect(drawn.week.label?.text).toBe('Semana:   81% usado      ')
+  expect(drawn.week.label?.props.color).toBe(AMARILLO)
+
+  // Al cambiar a Fable, el suyo: con su nombre, su barra y su renovación, en la hora del equipo.
+  state.model = 'claude-fable-5-1'
+
+  for (const surface of SURFACES) {
+    drawn = await band($, surface)
+    expect(drawn.week.label?.text, surface).toBe('Semana Fable: 12% usado  ')
+    expect(drawn.week.label?.text, surface).toHaveLength(drawn.context?.text.length ?? 0)
+    expect(drawn.week.label?.props.color, surface).toBe(VERDE)
+    expect(drawn.week.bar?.text, surface).toBe('█'.repeat(5) + '░'.repeat(35))
+    expect(drawn.week.resets?.text, surface).toBe(when(new Date(2026, 9, 9, 22, 0)))
+  }
+
+  // Y al volver a otro modelo, otra vez el de todos; cómo lo llame el motor da igual.
+  state.model = 'Opus 5.5'
+  expect((await band($, 'terminal')).week.label?.text).toBe('Semana:   81% usado      ')
+  state.model = 'Fable 5.1'
+  expect((await band($, 'terminal')).week.label?.text).toBe('Semana Fable: 12% usado  ')
+
+  // No vuelve a preguntar con cada respuesta: solo cuando la última consulta tiene 5 minutos.
+  state.usageText = report(64, 'Oct 12, 4:59am')
+  await ask(usage(222_807, 0, 0, 0))
+  expect(ran).toHaveLength(1)
+  await clock.advance(5 * 60_000)
+  // Lo que gasta un subagente no la dispara.
+  await ask(usage(700, 0, 0, 0), 'agente-1')
+  expect(ran).toHaveLength(1)
+  await ask(usage(222_807, 0, 0, 0))
+  await clock.settle()
+  expect(ran).toHaveLength(2)
+  drawn = await band($, 'terminal')
+  expect(drawn.week.label?.text).toBe('Semana Fable: 64% usado  ')
+  expect(drawn.week.label?.props.color).toBe(AMARILLO)
+  // `/usage` da a veces un minuto menos de la hora en punto: se redondea a los 5 minutos.
+  expect(drawn.week.resets?.text).toBe(when(new Date(2026, 9, 12, 5, 0)))
+
+  // Sin el límite de todos los modelos (aún sin respuestas), el propio se enseña igual.
+  state.limits = []
+  await measure(222_807)
+  expect((await band($, 'terminal')).week.label?.text).toBe('Semana Fable: 64% usado  ')
+  state.model = 'claude-opus-5-5'
+  expect((await band($, 'terminal')).week.label).toBeUndefined()
+})
+
+test('si la consulta de los límites por modelo falla o no trae ninguno, no se repite en la sesión', async ($, on) => {
+  const { ask, clock, measure, ran, start, state } = world($, on)
+
+  // En -p y en el SDK no hay banda que mirar: ni se pregunta.
+  state.usageText = 'Current week (Fable): 12% used · resets Oct 9, 10pm (Europe/Madrid)'
+  state.model = 'claude-fable-5-1'
+  await start(false)
+  await ask(usage(1_000, 0, 0, 0))
+  expect(ran).toHaveLength(0)
+
+  // Donde `claude` no arranca, o responde otra cosa, se queda con el límite de todos los modelos.
+  for (const bad of [null, 'No puedo ayudarte con eso.']) {
+    const before = ran.length
+    state.usageText = bad
+    state.limits = [{ kind: 'seven_day', percentUsed: 81 }]
+    await start()
+    await clock.settle()
+  await clock.settle()
+    expect(ran, String(bad)).toHaveLength(before + 1)
+    await clock.advance(10 * 60_000)
+    await ask(usage(1_000, 0, 0, 0))
+    await measure(1_000)
+    expect(ran, String(bad)).toHaveLength(before + 1)
+    expect((await band($, 'terminal')).week.label?.text.trimEnd(), String(bad)).toBe(
+      'Semana:   81% usado',
+    )
+  }
+
+  // Un plan sin límites por modelo: se pregunta una vez y basta.
+  const before = ran.length
+  state.usageText = 'Current week (all models): 81% used · resets Oct 9, 10pm (Europe/Madrid)'
+  await start()
+  await clock.settle()
+  await clock.advance(10 * 60_000)
+  await ask(usage(1_000, 0, 0, 0))
+  expect(ran).toHaveLength(before + 1)
+  expect((await band($, 'terminal')).week.label?.text.trimEnd()).toBe('Semana:   81% usado')
 })
 
 // Con el lector abierto el kit espera en cada paso a que acabe lo que el mod dejó en marcha: pocos pasos.

@@ -82,6 +82,28 @@ const LECTOR = [
 const LIMITE_SEMANAL = 'seven_day'
 const RESERVA_SEMANA = 54
 const DIAS = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'] as const
+// El límite semanal propio de un modelo (el de Fable, donde el plan lo tiene) no llega a los mods:
+// se le pregunta a Claude Code con su `/usage`, en un proceso aparte que no carga nada del usuario
+// ni guarda la sesión, y que no llama al modelo. Si algún día lo hiciera, que sea al más barato.
+const CONSULTA = [
+  'claude',
+  '-p',
+  '/usage',
+  '--safe-mode',
+  '--no-session-persistence',
+  '--model',
+  'haiku',
+] as const
+const CONSULTA_MS = 30_000
+// Con cada respuesta del hilo principal, si la última consulta tiene ya este tiempo, se repite.
+const REFRESCO_MS = 5 * 60_000
+const DIA_MS = 24 * 60 * 60_000
+// Las renovaciones de `/usage` se llevan al múltiplo de 5 minutos más cercano.
+const REDONDEO_MS = 5 * 60_000
+// «Current week (Fable): 12% used · resets Oct 9, 10pm (Europe/Madrid)»
+const LINEA_USO = /^Current week \((.+?)\): (\d+(?:\.\d+)?)% used(?: · resets ([^(\n]+?))?(?: \(.*\))?\s*$/gm
+const TODOS = 'all models'
+const MESES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 
 const CARPETA = '.claude/resumenes'
 const INSTRUCCIONES =
@@ -105,9 +127,18 @@ const uso = atom({ plugin: 'tokens-sesion', key: 'uso' } as const, null)
 // El límite semanal: % usado y cuándo se renueva; null hasta que el motor lo da con una respuesta.
 const semana = atom({ plugin: 'tokens-sesion', key: 'semana' } as const, null)
 
+// Los límites semanales propios de un modelo, por el nombre que les da `/usage` («Fable»).
+const porModelo = atom({ plugin: 'tokens-sesion', key: 'porModelo' } as const, [])
+
 // Las últimas lecturas del lector, en décimas de %, y si hay uno en marcha.
 let lecturas: { cpu: number; ram: number }[] = []
 let leyendo = false
+// La consulta de los límites por modelo: si hay quien mire la banda, cuándo fue la última, si hay
+// una en marcha y si ya no merece repetirla en esta sesión (falló, o el plan no tiene ninguno).
+let interactiva = false
+let consultado = 0
+let consultando = false
+let sinConsulta = false
 
 // La caché leída no cuenta: es el mismo contexto releído en cada petición.
 const gasto = (usage: ModelUsage): number =>
@@ -252,6 +283,84 @@ const limitar = async ($: EngineInterface, limits: readonly SessionRateLimit[]):
   await update($, semana, () => value)
 }
 
+// El instante de un «Oct 9, 10pm» o un «4:59am» de `/usage`, que vienen en la hora del equipo.
+const instante = (text: string, now: number): string | null => {
+  const found = /^(?:([A-Za-z]{3})[a-z]* (\d{1,2}), )?(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i.exec(text.trim())
+
+  if (!found) {
+    return null
+  }
+
+  const hoy = new Date(now)
+  const mes = found[1] === undefined ? hoy.getMonth() : MESES.indexOf(found[1].toLowerCase())
+
+  if (mes < 0) {
+    return null
+  }
+
+  const dia = found[2] === undefined ? hoy.getDate() : Number(found[2])
+  const horas = (Number(found[3]) % 12) + (found[5]?.toLowerCase() === 'pm' ? 12 : 0)
+  const date = new Date(hoy.getFullYear(), mes, dia, horas, Number(found[4] ?? 0))
+
+  // Una renovación nunca queda atrás: sin fecha es la de mañana; con ella, la del año que viene.
+  if (found[1] === undefined && date.getTime() < now) {
+    date.setDate(date.getDate() + 1)
+  } else if (date.getTime() < now - DIA_MS) {
+    date.setFullYear(date.getFullYear() + 1)
+  }
+
+  // `/usage` da unas veces «10pm» y otras «9:59pm» para la misma renovación.
+  return new Date(Math.round(date.getTime() / REDONDEO_MS) * REDONDEO_MS).toISOString()
+}
+
+// Los límites semanales por modelo que hay en la salida de `/usage`; null si no es lo esperado.
+const porModeloDe = (
+  text: string,
+  now: number,
+): { nombre: string; pct: number; renueva: string | null }[] | null => {
+  const found = [...text.matchAll(LINEA_USO)]
+
+  if (found.length === 0) {
+    return null
+  }
+
+  return found
+    .filter(line => line[1]?.toLowerCase() !== TODOS)
+    .map(line => ({
+      nombre: line[1] ?? '',
+      pct: Number(line[2]),
+      renueva: line[3] === undefined ? null : instante(line[3], now),
+    }))
+}
+
+// Pone al día los límites por modelo. Lo que falla una vez no se reintenta en la sesión, y donde
+// el plan no tiene ninguno tampoco se vuelve a preguntar.
+const consultar = async ($: EngineInterface): Promise<void> => {
+  if (!interactiva || sinConsulta || consultando) {
+    return
+  }
+
+  const now = await $.clock.now()
+
+  if (consultado !== 0 && now - consultado < REFRESCO_MS) {
+    return
+  }
+
+  consultando = true
+  consultado = now
+
+  try {
+    const done = await $.process.run([...CONSULTA], { stdin: '', timeoutMs: CONSULTA_MS })
+    const limits = done.exitCode === 0 ? porModeloDe(done.stdout, now) : null
+    sinConsulta = limits === null || limits.length === 0
+    await update($, porModelo, () => limits ?? [])
+  } catch {
+    sinConsulta = true
+  }
+
+  consultando = false
+}
+
 // Lee al lector mientras viva: el bucle es la vida del proceso, que acaba con él o con el mod.
 const leer = async ($: EngineInterface): Promise<void> => {
   if (leyendo) {
@@ -307,8 +416,13 @@ export const register: Register = on => {
     const started = await next(e)
 
     // Solo donde hay alguien mirando la banda.
+    interactiva = e.isInteractive
+    consultado = 0
+    sinConsulta = false
+
     if (e.isInteractive) {
       leer($).catch(() => undefined)
+      consultar($).catch(() => undefined)
     }
 
     return started
@@ -369,6 +483,10 @@ export const register: Register = on => {
         const sent = enviado(usage)
         await update($, contexto, () => sent)
       }
+    }
+
+    if (e.agentId === undefined) {
+      consultar($).catch(() => undefined)
     }
 
     return response
@@ -433,7 +551,11 @@ export const register: Register = on => {
     const rige = await read($, efectivo)
     const tope = await read($, maximo)
     const medido = await read($, uso)
-    const limite = e.props.maxRows >= 2 ? await read($, semana) : null
+    // Con un modelo que tiene su propio límite semanal se enseña ese; con los demás, el de todos.
+    const propios = e.props.maxRows >= 2 ? await read($, porModelo) : []
+    const modelo = propios.length === 0 ? '' : (await $.session.model()).toLowerCase()
+    const propio = propios.find(limit => modelo.includes(limit.nombre.toLowerCase()))
+    const limite = e.props.maxRows >= 2 ? (propio ?? (await read($, semana))) : null
     const reserva = Math.max(
       RESERVA + (medido === null ? 0 : RESERVA_USO),
       limite === null ? 0 : RESERVA_SEMANA,
@@ -441,7 +563,9 @@ export const register: Register = on => {
     const ancho = Math.max(BARRA_MIN, Math.min(BARRA_MAX, e.props.bodyColumns - reserva))
     const titulo = `Contexto: ${conPuntos(tokens)} tokens `
     const usado = limite === null ? 0 : Math.round(limite.pct)
-    const tituloSemana = `Semana:   ${usado}% usado `
+    const tituloSemana = propio
+      ? `Semana ${propio.nombre}: ${usado}% usado `
+      : `Semana:   ${usado}% usado `
     // Con las dos líneas, sus barras empiezan en la misma columna.
     const largo = limite === null ? 0 : Math.max(titulo.length, tituloSemana.length)
     const llenas = Math.max(0, Math.min(ancho, Math.round((usado * ancho) / 100)))

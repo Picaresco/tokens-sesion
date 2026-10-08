@@ -10,6 +10,7 @@ declare module 'claude-code' {
       sinRaton: boolean
       uso: { cpu: number; ram: number } | null
       semana: { pct: number; renueva: string | null } | null
+      porModelo: { nombre: string; pct: number; renueva: string | null }[]
     }
   }
 }
