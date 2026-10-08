@@ -1,0 +1,7 @@
+{
+  "name": "tokens-sesion",
+  "version": "0.5.0",
+  "description": "Banda sobre el prompt con el contexto (cifra y barra de verde a rojo), el gasto de la sesión y el uso de CPU y RAM del equipo; hace que el motor compacte, también a mitad de una tarea, al llegar el contexto al umbral, que se cambia arrastrando la marca de la barra, y guarda el resumen de cada compactación.",
+  "author": { "name": "Alberto" },
+  "types": "./types/index.d.ts"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "tokens-sesion",
+  "owner": { "name": "Alberto Diaz" },
+  "metadata": {
+    "description": "Mod de Claude Code: banda con el contexto, compactado automático a medida y uso de CPU y RAM."
+  },
+  "plugins": [
+    {
+      "name": "tokens-sesion",
+      "source": "./",
+      "description": "Banda sobre el prompt con el contexto (cifra y barra de verde a rojo), el gasto de la sesión y el uso de CPU y RAM; el motor compacta al llegar al umbral que marques, también a mitad de una tarea, y se guarda el resumen."
+    }
+  ]
+}

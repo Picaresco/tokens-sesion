@@ -1,0 +1,7 @@
+# Tipos que el motor escribe al cargar el mod en desarrollo
+.claude-plugin/types/
+# Resumenes y ajustes de sesiones abiertas en esta carpeta
+.claude/
+.remember/
+node_modules/
+*.log
