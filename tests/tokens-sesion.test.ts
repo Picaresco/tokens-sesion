@@ -6,6 +6,7 @@ import type {
   SessionCompactInput,
   SessionCompactResult,
   SessionMessage,
+  SessionRateLimit,
   TurnUsage,
 } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
@@ -17,10 +18,10 @@ const PORCENTAJE = 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'
 const NOW = Date.UTC(2026, 9, 8, 0, 5, 12)
 const MESSAGE: SessionMessage = { role: 'user', text: 'hola', toolUses: [] }
 
-const props = (bodyColumns: number) => ({
+const props = (bodyColumns: number, maxRows = 10) => ({
   hasSurvey: false,
   isWorking: false,
-  maxRows: 10,
+  maxRows,
   bodyColumns,
   scroll: { offset: 0, bodyRows: 10 },
   view: {},
@@ -62,6 +63,8 @@ const world = (
     window: 1_000_000,
     // Si el lector de CPU y RAM arranca; sin él es otro sistema, donde no existe.
     reader: false,
+    // Los límites del plan que el motor conoce: ninguno hasta la primera respuesta.
+    limits: [] as SessionRateLimit[],
   }
   // Lo que el lector va escribiendo, y cada vez que el mod lo lanzó.
   const pipe = {
@@ -108,7 +111,7 @@ const world = (
     value: {
       startedAt: 0,
       context: { window: state.window, tokens: state.context },
-      rateLimits: [],
+      rateLimits: state.limits,
     },
   }))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
@@ -201,17 +204,17 @@ const world = (
     measure: (tokens: number | undefined) =>
       $.session.measure({
         context: { window: state.window, tokens },
-        rateLimits: [],
-        changed: ['context'],
+        rateLimits: state.limits,
+        changed: ['context', 'rateLimits'],
       }),
   }
 }
 
-const mount = ($: Engine, surface: (typeof SURFACES)[number], bodyColumns = 120) =>
+const mount = ($: Engine, surface: (typeof SURFACES)[number], bodyColumns = 120, maxRows = 10) =>
   $.ui.mount({
     plugin: 'tokens-sesion',
     component: 'AbovePrompt',
-    props: props(bodyColumns),
+    props: props(bodyColumns, maxRows),
     surface,
   })
 
@@ -221,8 +224,13 @@ type Band = Awaited<ReturnType<typeof mount>>
 const bar = async (ui: Band): Promise<string> =>
   (await ui.findAll({ type: 'Text', in: 'deslizador' })).map(cell => cell.text).join('')
 
-const band = async ($: Engine, surface: (typeof SURFACES)[number], bodyColumns = 120) => {
-  const ui = await mount($, surface, bodyColumns)
+const band = async (
+  $: Engine,
+  surface: (typeof SURFACES)[number],
+  bodyColumns = 120,
+  maxRows = 10,
+) => {
+  const ui = await mount($, surface, bodyColumns, maxRows)
   const texts = await ui.findAll({ type: 'Text' })
   const cells = await ui.findAll({ type: 'Text', in: 'deslizador' })
   await ui.unmount()
@@ -245,6 +253,12 @@ const band = async ($: Engine, surface: (typeof SURFACES)[number], bodyColumns =
     texts: texts.map(text => text.text),
     bar: cells.map(cell => cell.text).join(''),
     segments,
+    // La línea del límite semanal: su etiqueta, su barra (un solo texto) y cuándo se renueva.
+    week: {
+      label: texts.find(text => text.text.startsWith('Semana')),
+      bar: texts.find(text => /^[█░]{2,}$/.test(text.text)),
+      resets: texts.find(text => text.text.includes('se renueva')),
+    },
     // Las cifras de CPU y RAM, cada una con su color; nada mientras no hay lecturas.
     use: texts
       .filter(text => /^(CPU|RAM) /.test(text.text))
@@ -441,6 +455,99 @@ test('la banda no lleva ningún aviso para el ratón: solo el contexto, la barra
       )
     }
   }
+})
+
+test('con el límite semanal del plan añade una línea con su barra bajo la de contexto', async ($, on) => {
+  const { ask, measure, start, state } = world($, on)
+  const VERDE = '#22c55e'
+  const AMARILLO = '#facc15'
+  const ROJO = '#ef4444'
+  const RESETS = '2026-10-09T20:00:00.000Z'
+  const week = (percentUsed: number, resetsAt?: string): SessionRateLimit[] => [
+    { kind: 'five_hour', percentUsed: 32, resetsAt: '2026-10-08T03:00:00.000Z' },
+    { kind: 'seven_day', percentUsed, ...(resetsAt === undefined ? {} : { resetsAt }) },
+  ]
+  // La hora es la del equipo: la misma cuenta que hace el mod, aquí.
+  const at = new Date(RESETS)
+  const day = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'][at.getDay()]
+  const hour = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+
+  // Hasta la primera respuesta el motor no da límites: la banda de siempre, en una línea.
+  await start()
+  await ask(usage(533_700, 0, 0, 0))
+  expect((await band($, 'terminal')).week.label).toBeUndefined()
+
+  state.limits = week(80, RESETS)
+  await measure(533_700)
+
+  for (const surface of SURFACES) {
+    const { bar, context, week: drawn } = await band($, surface)
+    // Las dos etiquetas miden lo mismo: las barras empiezan en la misma columna y son igual de anchas.
+    expect(context?.text, surface).toBe('Contexto: 533.700 tokens ')
+    expect(drawn.label?.text, surface).toBe('Semana:   80% usado      ')
+    expect(bar, surface).toHaveLength(40)
+    // El 80 % de 40 celdas; hasta 60 verde, hasta 85 amarillo, y rojo por encima.
+    expect(drawn.bar?.text, surface).toBe('█'.repeat(32) + '░'.repeat(8))
+    expect(drawn.label?.props.color, surface).toBe(AMARILLO)
+    expect(drawn.bar?.props.color, surface).toBe(AMARILLO)
+    expect(drawn.resets?.text, surface).toBe(` · se renueva ${day} ${at.getDate()}, ${hour}`)
+    expect(drawn.resets?.text, surface).toMatch(/^ · se renueva [a-zéá]{3} \d{1,2}, \d\d:\d\d$/)
+    expect(drawn.resets?.props.dimColor, surface).toBe(true)
+  }
+
+  // Con una etiqueta de contexto más corta que la de la semana, se alarga la de contexto.
+  await ask(usage(90, 0, 0, 0))
+  state.limits = week(100, RESETS)
+  await measure(90)
+  let drawn = await band($, 'terminal')
+  expect(drawn.context?.text).toBe('Contexto: 90 tokens  ')
+  expect(drawn.week.label?.text).toBe('Semana:   100% usado ')
+  expect(drawn.week.bar?.text).toBe('█'.repeat(40))
+  expect(drawn.week.bar?.props.color).toBe(ROJO)
+
+  // El porcentaje se redondea, y sin fecha de renovación no se inventa.
+  const steps = [
+    [0, 0, VERDE],
+    [59.6, 60, VERDE],
+    [60.5, 61, AMARILLO],
+    [85.4, 85, AMARILLO],
+    [85.5, 86, ROJO],
+  ] as const
+
+  for (const [percentUsed, shown, color] of steps) {
+    state.limits = week(percentUsed)
+    await measure(90)
+    drawn = await band($, 'terminal')
+    expect(drawn.week.label?.text.trimEnd(), String(percentUsed)).toBe(`Semana:   ${shown}% usado`)
+    expect(drawn.week.label?.props.color, String(percentUsed)).toBe(color)
+    expect(drawn.week.bar?.text, String(percentUsed)).toHaveLength(40)
+    expect(drawn.week.resets, String(percentUsed)).toBeUndefined()
+  }
+
+  // En un terminal estrecho las dos barras se encogen a la vez.
+  state.limits = week(80, RESETS)
+  await measure(90)
+  drawn = await band($, 'terminal', 80)
+  expect(drawn.bar).toHaveLength(26)
+  expect(drawn.week.bar?.text).toBe('█'.repeat(21) + '░'.repeat(5))
+
+  // Donde solo cabe una línea, la de contexto.
+  drawn = await band($, 'terminal', 120, 1)
+  expect(drawn.week.label).toBeUndefined()
+  expect(drawn.context?.text).toBe('Contexto: 90 tokens ')
+
+  // Sin límite semanal (otro plan), vuelve a una línea.
+  state.limits = [{ kind: 'five_hour', percentUsed: 32 }]
+  await measure(90)
+  drawn = await band($, 'terminal')
+  expect(drawn.week.label).toBeUndefined()
+  expect(drawn.week.bar).toBeUndefined()
+  expect(drawn.texts.join('').replace(drawn.bar, '')).toBe('Contexto: 90 tokens  · sesión: 533.790')
+
+  // Al recargar el mod a media sesión el motor ya tiene los límites: salen sin esperar a una respuesta.
+  state.limits = week(80, RESETS)
+  await start()
+  expect((await band($, 'terminal')).week.label?.text).toBe('Semana:   80% usado ')
 })
 
 // Con el lector abierto el kit espera en cada paso a que acabe lo que el mod dejó en marcha: pocos pasos.

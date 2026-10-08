@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register, SessionRateLimit } from 'claude-code'
 
 // Cada tramo se pinta con su color hasta `hasta` tokens de contexto, incluido; por encima del último, ROJO.
 const TRAMOS = [
@@ -77,6 +77,12 @@ const LECTOR = [
   '}',
 ].join(' ')
 
+// El límite semanal del plan (todos los modelos) va en una segunda línea, con su barra bajo la de
+// contexto. RESERVA_SEMANA: las columnas de su etiqueta y de cuándo se renueva.
+const LIMITE_SEMANAL = 'seven_day'
+const RESERVA_SEMANA = 54
+const DIAS = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'] as const
+
 const CARPETA = '.claude/resumenes'
 const INSTRUCCIONES =
   'Resumen exhaustivo para continuar la sesión sin perder nada. Conserva todos los puntos: ' +
@@ -95,6 +101,9 @@ const maximo = atom({ plugin: 'tokens-sesion', key: 'maximo' } as const, UMBRAL_
 const sinRaton = atom({ plugin: 'tokens-sesion', key: 'sinRaton' } as const, false)
 // La media de CPU y RAM en %, o null mientras no hay lecturas (otro sistema, sin lector).
 const uso = atom({ plugin: 'tokens-sesion', key: 'uso' } as const, null)
+
+// El límite semanal: % usado y cuándo se renueva; null hasta que el motor lo da con una respuesta.
+const semana = atom({ plugin: 'tokens-sesion', key: 'semana' } as const, null)
 
 // Las últimas lecturas del lector, en décimas de %, y si hay uno en marcha.
 let lecturas: { cpu: number; ram: number }[] = []
@@ -119,6 +128,19 @@ const colorUso = (pct: number): string => USOS.find(tramo => pct <= tramo.hasta)
 // La media, en % entero, de unas lecturas en décimas.
 const media = (decimas: number[]): number =>
   Math.round(decimas.reduce((sum, value) => sum + value, 0) / decimas.length / 10)
+
+// «vie 9, 22:00», en la hora del equipo.
+const cuando = (iso: string): string | null => {
+  const date = new Date(iso)
+
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+
+  const hora = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+
+  return `${DIAS[date.getDay()] ?? ''} ${date.getDate()}, ${hora}`
+}
 
 const vale = (value: unknown): value is number =>
   value === 0 ||
@@ -223,6 +245,13 @@ const fijar = async ($: EngineInterface, limite: number): Promise<void> => {
   await aplicar($)
 }
 
+// De los límites que da el motor, el semanal; sin él (otro plan, o aún sin respuestas), nada.
+const limitar = async ($: EngineInterface, limits: readonly SessionRateLimit[]): Promise<void> => {
+  const found = limits.find(limit => limit.kind === LIMITE_SEMANAL)
+  const value = found ? { pct: found.percentUsed, renueva: found.resetsAt ?? null } : null
+  await update($, semana, () => value)
+}
+
 // Lee al lector mientras viva: el bucle es la vida del proceso, que acaba con él o con el mod.
 const leer = async ($: EngineInterface): Promise<void> => {
   if (leyendo) {
@@ -273,6 +302,8 @@ export const register: Register = on => {
       argumentHint: '[tokens | 0]',
     })
     await cargar($)
+    // Al recargar el mod a media sesión el motor ya los tiene.
+    await limitar($, (await $.session.usage()).rateLimits)
     const started = await next(e)
 
     // Solo donde hay alguien mirando la banda.
@@ -350,6 +381,7 @@ export const register: Register = on => {
       await update($, contexto, () => tokens)
     }
 
+    await limitar($, e.rateLimits)
     // Otra sesión pudo mover el umbral, y esta cambiar de modelo.
     await cargar($)
 
@@ -401,8 +433,19 @@ export const register: Register = on => {
     const rige = await read($, efectivo)
     const tope = await read($, maximo)
     const medido = await read($, uso)
-    const libres = e.props.bodyColumns - RESERVA - (medido === null ? 0 : RESERVA_USO)
-    const ancho = Math.max(BARRA_MIN, Math.min(BARRA_MAX, libres))
+    const limite = e.props.maxRows >= 2 ? await read($, semana) : null
+    const reserva = Math.max(
+      RESERVA + (medido === null ? 0 : RESERVA_USO),
+      limite === null ? 0 : RESERVA_SEMANA,
+    )
+    const ancho = Math.max(BARRA_MIN, Math.min(BARRA_MAX, e.props.bodyColumns - reserva))
+    const titulo = `Contexto: ${conPuntos(tokens)} tokens `
+    const usado = limite === null ? 0 : Math.round(limite.pct)
+    const tituloSemana = `Semana:   ${usado}% usado `
+    // Con las dos líneas, sus barras empiezan en la misma columna.
+    const largo = limite === null ? 0 : Math.max(titulo.length, tituloSemana.length)
+    const llenas = Math.max(0, Math.min(ancho, Math.round((usado * ancho) / 100)))
+    const renueva = limite === null || limite.renueva === null ? null : cuando(limite.renueva)
     const marca = rige === 0 ? -1 : celdaDe(rige, ancho)
     const barra = celdas(tokens, ancho)
     const indices = barra.map((_, i) => i)
@@ -413,9 +456,9 @@ export const register: Register = on => {
       (e.surface === 'terminal' || e.surface === 'desktop') && !(await read($, sinRaton))
     const Client = conRaton && 'Client' in table ? table.Client : undefined
 
-    return (
+    const linea = (
       <Box>
-        <Text color={colorDe(tokens)}>Contexto: {conPuntos(tokens)} tokens </Text>
+        <Text color={colorDe(tokens)}>{titulo.padEnd(largo)}</Text>
         {Client === undefined ? (
           barra.map((celda, i) =>
             i === marca && celda.text !== '●' ? (
@@ -446,6 +489,21 @@ export const register: Register = on => {
         {medido !== null && <Text color={colorUso(medido.cpu)}>CPU {medido.cpu}%</Text>}
         {medido !== null && <Text dimColor> · </Text>}
         {medido !== null && <Text color={colorUso(medido.ram)}>RAM {medido.ram}%</Text>}
+      </Box>
+    )
+
+    if (limite === null) {
+      return linea
+    }
+
+    return (
+      <Box flexDirection="column">
+        {linea}
+        <Box>
+          <Text color={colorUso(usado)}>{tituloSemana.padEnd(largo)}</Text>
+          <Text color={colorUso(usado)}>{'█'.repeat(llenas) + '░'.repeat(ancho - llenas)}</Text>
+          {renueva !== null && <Text dimColor> · se renueva {renueva}</Text>}
+        </Box>
       </Box>
     )
   })

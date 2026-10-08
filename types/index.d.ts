@@ -9,6 +9,7 @@ declare module 'claude-code' {
       maximo: number
       sinRaton: boolean
       uso: { cpu: number; ram: number } | null
+      semana: { pct: number; renueva: string | null } | null
     }
   }
 }

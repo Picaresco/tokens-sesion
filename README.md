@@ -6,6 +6,7 @@ el resumen** de cada compactación.
 
 ```
 Contexto: 222.807 tokens ████████●░░░░░░░░░░░░░░░░░┃░░░░░░░░░░░░░ · sesión: 2.431.870 · CPU 23% · RAM 61%
+Semana:   80% usado      ████████████████████████████████░░░░░░░░ · se renueva vie 9, 22:00
 ```
 
 ## El problema que resuelve
@@ -46,8 +47,9 @@ Probado con Claude Code 2.1.293.
 | Barra | De 0 a 1.000.000 de tokens, con los mismos colores. `●` es el punto actual y `┃` el umbral en el que se compacta |
 | `sesión: N` | Gasto acumulado de la sesión: entrada, salida y escritura de caché, subagentes incluidos. La caché leída no cuenta |
 | `CPU n% · RAM n%` | Uso de todo el equipo: media de las 5 últimas lecturas, una cada 12 segundos. Verde hasta 60 %, amarillo hasta 85 %, rojo por encima. Solo en Windows |
+| `Semana: n% usado` | Segunda línea: el límite semanal de tu plan (todos los modelos), con su barra bajo la de contexto y cuándo se renueva, en la hora de tu equipo. Mismos colores que CPU y RAM. Aparece con la primera respuesta de cada sesión y solo en planes de suscripción |
 
-En terminales estrechos la barra se encoge.
+En terminales estrechos las barras se encogen.
 
 ## Compactado automático
 
@@ -92,6 +94,8 @@ todas tus sesiones y proyectos.
 - El punto exacto de compactado sale de las reservas que usa el motor en la versión
   2.1.293. Si una versión posterior las cambia, la marca puede desviarse unos miles
   de tokens.
+- Del plan solo se enseña el límite semanal de todos los modelos: el semanal por modelo no
+  llega a los mods.
 - CPU y RAM solo se muestran en Windows y en sesiones interactivas. En macOS y Linux
   el resto de la banda funciona igual.
 
