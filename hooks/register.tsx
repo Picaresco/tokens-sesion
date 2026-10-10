@@ -1208,6 +1208,7 @@ const textoHistorico = (datos: {
   agentes: readonly Agente[]
   tareas: readonly { n: number; inicio: number; texto: string }[]
   compactaciones: readonly Compactacion[]
+  leido: number
 }): string => {
   const celda = (text: string): string => text.replace(/\|/g, '\\|').replace(/\s+/g, ' ')
   const lines = [
@@ -1220,6 +1221,7 @@ const textoHistorico = (datos: {
     `- Tokens gastados: ${conPuntos(datos.total)} (hilo principal ${conPuntos(Math.max(0, datos.total - datos.agentesTok))}, agentes ${conPuntos(datos.agentesTok)})`,
     ...(datos.usd === null ? [] : [`- Coste a precio de API: ${datos.usd.toFixed(2)} $`]),
     `- Compactaciones: ${datos.compactaciones.length}`,
+    ...(datos.leido > 0 ? [`- Caché mantenida en las pausas: ${conPuntos(datos.leido)} tokens leídos`] : []),
   ]
 
   if (datos.pasos.length > 0) {
@@ -1314,6 +1316,7 @@ const historiar = async ($: EngineInterface): Promise<void> => {
       agentes: lista,
       tareas: await read($, tareas),
       compactaciones: hechas,
+      leido: (await read($, cache)).leido,
     }),
   )
   await update($, historico, () => file)
@@ -1329,6 +1332,9 @@ const reiniciarSesion = async ($: EngineInterface): Promise<void> => {
   const now = await $.clock.now()
   await update($, nacida, () => now)
   await update($, historico, () => null)
+  await update($, cache, estado => ({ ...estado, ultima: null, latidos: 0, nota: null }))
+  pararLatido()
+  prefijoNuevo = true
   sueltos.clear()
 }
 
@@ -1336,7 +1342,7 @@ const dibujarSesion = async (
   $: EngineInterface,
   e: RenderInput<'Pane'>,
 ): Promise<RenderElement> => {
-  const { Box, Text } = $.ui.resolve(e)
+  const { Box, Text, Button } = $.ui.resolve(e)
   const now = await $.clock.now()
   const usage = await $.session.usage()
   const turnos = await $.session.turns().catch(() => null)
@@ -1409,6 +1415,35 @@ const dibujarSesion = async (
     limite('Semana', limite7)
   }
 
+  titulo('Caché')
+
+  for (const [etiqueta, texto] of await lineasCache($, now)) {
+    dato(etiqueta, texto)
+  }
+
+  const guardada = await read($, cache)
+  filas.push(
+    <Box flexDirection="row">
+      <Text dimColor>{'Mantenerla'.padEnd(13)}</Text>
+      <Button
+        key="cache-viva"
+        label={guardada.viva ? 'sí' : 'no'}
+        variant={guardada.viva ? 'primary' : 'secondary'}
+        onPress={() => {
+          void read($, cache).then(estado => fijarCache($, !estado.viva))
+        }}
+      />
+    </Box>,
+  )
+
+  if (guardada.nota !== null) {
+    filas.push(
+      <Text dimColor wrap="wrap">
+        {guardada.nota}
+      </Text>,
+    )
+  }
+
   titulo('Trabajo')
   dato(
     'Tareas',
@@ -1452,6 +1487,229 @@ const dibujarSesion = async (
   )
 }
 
+// ---------------------------------------------------------------------------------------------
+// Caché viva: en las pausas, lo más barato entre mantener la caché, compactar o dejarla caducar.
+// ---------------------------------------------------------------------------------------------
+// El motor guarda en caché la conversación ya enviada: mientras dura, cada petición la relee casi
+// gratis; si caduca, la siguiente la reescribe entera a precio de escritura. Con el ajuste activado
+// y la sesión en reposo, el mod hace poco antes de que caduque una consulta mínima sobre la propia
+// conversación (`$.model.fork`: lee la caché y renueva su plazo sin dejar nada en la conversación).
+// Es la regla del alquiler de esquís: se paga el «alquiler» (un latido por hora) hasta que lo
+// pagado iguala lo que cuesta «comprar» (compactar, o dejarla caducar); entonces se hace lo más
+// barato de esas dos cosas y se para. Así, en una sesión a la que no se vuelve se pierde como mucho
+// lo que habría costado una caducidad.
+const CLAVE_CACHE = 'cacheViva'
+const TTL_LARGO_MS = 60 * 60_000
+const TTL_CORTO_MS = 5 * 60_000
+// El latido sale con este margen antes de que caduque; el plazo cuenta desde que empieza la petición.
+const MARGEN_MS = 8 * 60_000
+const HOLGURA_MS = 20_000
+// Como mucho estos latidos por pausa, salga lo que salga la cuenta.
+const MAX_LATIDOS = 12
+// Por debajo de este contexto no se compacta: no hay nada que ganar.
+const MIN_COMPACTAR = 150_000
+// Lo que se estima que ocupa el resumen de una compactación y el contexto que deja.
+const RESUMEN_TOKENS = 15_000
+const TRAS_COMPACTAR = 45_000
+// Precios en veces el de un token de entrada: escribir la caché de una hora, un token de salida
+// y leer la caché según el modelo.
+const PRECIO_ESCRITURA = 2
+const PRECIO_SALIDA = 5
+const precioLectura = (modelo: string): number =>
+  /fable|mythos/i.test(modelo) ? 0.025 : /opus-5-5/i.test(modelo) ? 0.05 : 0.1
+const LATIDO = 'Responde solo con la palabra: ok'
+// Un acierto es leer de caché al menos esta parte de lo enviado.
+const ACIERTO = 0.5
+
+const cache = atom({ plugin: 'tokens-sesion', key: 'cache' } as const, {
+  viva: false,
+  ttl: 'sin confirmar',
+  ultima: null,
+  latidos: 0,
+  leido: 0,
+  nota: null,
+})
+
+// El temporizador del próximo latido, si hay uno en marcha.
+let cancelarLatido: (() => void) | null = null
+// Con un turno del hilo principal en marcha no hay pausa que cubrir.
+let enTurno = false
+// Tras compactar o cambiar de modelo, el siguiente fallo de caché no dice nada de su duración.
+let prefijoNuevo = true
+let modeloAnterior = ''
+
+// Lo que cuesta cada salida con `contexto` tokens, en tokens a precio de entrada, y lo que se decide:
+// cuántos latidos como mucho y qué se hace después.
+const planCache = (
+  contexto: number,
+  modelo: string,
+): { veces: number; final: 'compactar' | 'caducar' } => {
+  const lectura = precioLectura(modelo)
+  const latido = contexto * lectura
+  const caducar = contexto * (PRECIO_ESCRITURA - lectura)
+  const compactar =
+    contexto * lectura +
+    RESUMEN_TOKENS * PRECIO_SALIDA +
+    TRAS_COMPACTAR * PRECIO_ESCRITURA +
+    TRAS_COMPACTAR * (PRECIO_ESCRITURA - lectura)
+  const final = contexto >= MIN_COMPACTAR && compactar < caducar ? 'compactar' : 'caducar'
+  const tope = final === 'compactar' ? compactar : caducar
+
+  return { veces: latido <= 0 ? 0 : Math.min(MAX_LATIDOS, Math.floor(tope / latido)), final }
+}
+
+const pararLatido = (): void => {
+  cancelarLatido?.()
+  cancelarLatido = null
+}
+
+// Programa el próximo latido para poco antes de que caduque la caché, si toca mantenerla.
+const armarLatido = async ($: EngineInterface): Promise<void> => {
+  pararLatido()
+  const estado = await read($, cache)
+
+  if (!interactiva || !estado.viva || estado.ttl !== '1h' || estado.ultima === null) {
+    return
+  }
+
+  const espera = estado.ultima + TTL_LARGO_MS - MARGEN_MS - (await $.clock.now())
+  const timer = $.clock.after(Math.max(1_000, espera), () => {
+    latir($).catch(() => undefined)
+  })
+  cancelarLatido = () => timer.cancel()
+}
+
+const latir = async ($: EngineInterface): Promise<void> => {
+  cancelarLatido = null
+  const estado = await read($, cache)
+
+  if (!estado.viva || estado.ttl !== '1h' || estado.ultima === null || enTurno) {
+    return
+  }
+
+  const inicio = await $.clock.now()
+
+  if (inicio - estado.ultima >= TTL_LARGO_MS - HOLGURA_MS) {
+    await update($, cache, now => ({ ...now, nota: 'La caché caducó antes de poder mantenerla.' }))
+
+    return
+  }
+
+  const tokens = (await read($, contexto)) ?? 0
+  const { veces, final } = planCache(tokens, await $.session.model())
+
+  if (estado.latidos < veces) {
+    const reply = await $.model.fork({ prompt: LATIDO })
+    const leido = 'usage' in reply ? (reply.usage?.cache_read_input_tokens ?? 0) : 0
+
+    if (reply.isAnswered && leido >= tokens * ACIERTO) {
+      await update($, cache, now => ({
+        ...now,
+        ultima: inicio,
+        latidos: now.latidos + 1,
+        leido: now.leido + leido,
+        nota: `Mantenida a las ${hora(inicio).slice(0, 5)} (${now.latidos + 1} de ${veces} en esta pausa).`,
+      }))
+      await armarLatido($)
+
+      return
+    }
+
+    await update($, cache, now => ({
+      ...now,
+      nota: reply.isAnswered
+        ? 'La caché ya no estaba: no se sigue manteniendo en esta pausa.'
+        : 'No se pudo mantener la caché: la consulta falló.',
+    }))
+
+    return
+  }
+
+  if (final === 'compactar') {
+    await update($, cache, now => ({
+      ...now,
+      nota: `Tras ${duracion(now.latidos * (TTL_LARGO_MS - MARGEN_MS))} de pausa salía más barato compactar: compactada a las ${hora(inicio).slice(0, 5)}.`,
+    }))
+    await $.command.run({ command: 'compact', args: '' })
+
+    return
+  }
+
+  await update($, cache, now => ({
+    ...now,
+    nota: `Tras ${duracion(now.latidos * (TTL_LARGO_MS - MARGEN_MS))} de pausa sale más barato dejarla caducar: no se mantiene más.`,
+  }))
+}
+
+// Cada petición del hilo principal dice cuánto dura la caché (si acertó tras un hueco de más de
+// cinco minutos, es la de una hora) y reinicia la cuenta de la pausa.
+const observarCache = async (
+  $: EngineInterface,
+  inicio: number,
+  usage: ModelUsage & { model?: string },
+): Promise<void> => {
+  const enviados = enviado(usage)
+  const acierto = enviados > 0 && usage.cache_read_input_tokens >= enviados * ACIERTO
+  const modelo = usage.model ?? ''
+  const fiable = !prefijoNuevo && modelo === modeloAnterior
+  prefijoNuevo = false
+  modeloAnterior = modelo
+
+  await update($, cache, now => {
+    const hueco = now.ultima === null ? 0 : inicio - now.ultima
+    const largo = hueco > TTL_CORTO_MS + HOLGURA_MS
+    const ttl =
+      largo && acierto
+        ? '1h'
+        : largo && !acierto && fiable && hueco < TTL_LARGO_MS - MARGEN_MS
+          ? '5m'
+          : now.ttl
+
+    return { ...now, ttl, ultima: inicio, latidos: 0, nota: now.latidos > 0 ? now.nota : null }
+  })
+  await armarLatido($)
+}
+
+const fijarCache = async ($: EngineInterface, viva: boolean): Promise<void> => {
+  await $.store.set(CLAVE_CACHE, viva)
+  await update($, cache, now => ({ ...now, viva, nota: null }))
+  await armarLatido($)
+}
+
+// Lo que dice la pestaña Sesión de la caché, línea a línea: [etiqueta, texto].
+const lineasCache = async ($: EngineInterface, now: number): Promise<[string, string][]> => {
+  const estado = await read($, cache)
+  const lines: [string, string][] = [
+    [
+      'Duración',
+      estado.ttl === '1h' ? '1 hora' : estado.ttl === '5m' ? '5 minutos' : 'sin confirmar todavía',
+    ],
+  ]
+
+  if (estado.ultima !== null && estado.ttl !== 'sin confirmar') {
+    const fin = estado.ultima + (estado.ttl === '1h' ? TTL_LARGO_MS : TTL_CORTO_MS)
+    lines.push(['Caduca', fin > now ? `a las ${hora(fin).slice(0, 5)}` : 'ya caducó'])
+  }
+
+  if (estado.viva) {
+    const { veces, final } = planCache((await read($, contexto)) ?? 0, await $.session.model())
+    lines.push([
+      'Plan',
+      estado.ttl === '1h'
+        ? `mantenerla hasta ${veces} h de pausa; después, ${final === 'compactar' ? 'compactar' : 'dejarla caducar'}`
+        : estado.ttl === '5m'
+          ? 'con caché de 5 minutos no compensa mantenerla'
+          : 'empieza cuando se confirme que dura 1 hora',
+    ])
+  }
+
+  if (estado.leido > 0) {
+    lines.push(['Leído', `${conPuntos(estado.leido)} tokens de caché en mantenerla`])
+  }
+
+  return lines
+}
+
 // Un plugin engancha cada evento una sola vez: el arranque de la sesión y las peticiones al modelo
 // son también de la banda, y sus hooks llaman a estas tres funciones.
 
@@ -1460,13 +1718,15 @@ const arrancarAgentes = async ($: EngineInterface, isInteractive: boolean): Prom
   await $.command.register({
     name: COMANDO_AGENTES,
     description: 'Panel con los agentes de cada tarea: inicio, fin, duración y tokens',
-    argumentHint: '[tareas | rutas | sesion | cerrar | limpiar]',
+    argumentHint: '[tareas | rutas | sesion | cache si|no | cerrar | limpiar]',
   })
   const stored = validas(await $.store.get(CLAVE))
   await update($, rutas, () => stored)
   // Al recargar el mod la conversación sigue: su histórico conserva el nombre.
   const now = await $.clock.now()
   await update($, nacida, born => born ?? now)
+  const viva = (await $.store.get(CLAVE_CACHE)) === true
+  await update($, cache, estado => ({ ...estado, viva }))
 
   // El plan solo interesa donde hay alguien mirando el panel.
   if (isInteractive) {
@@ -1530,6 +1790,17 @@ const registrarAgentes = (on: On): void => {
       return { text: 'Panel de agentes cerrado. El registro sigue: /agentes lo vuelve a abrir.' }
     }
 
+    if (typed === 'cache si' || typed === 'cache sí' || typed === 'cache no') {
+      const viva = typed !== 'cache no'
+      await fijarCache($, viva)
+
+      return {
+        text: viva
+          ? 'Caché viva activada: en las pausas se mantiene mientras sea lo más barato, y después se compacta o se deja caducar.'
+          : 'Caché viva desactivada: en las pausas no se hace nada.',
+      }
+    }
+
     if (typed === 'limpiar') {
       await update($, pasos, () => [])
       await update($, agentes, () => [])
@@ -1541,7 +1812,7 @@ const registrarAgentes = (on: On): void => {
 
     if (typed !== '' && typed !== 'rutas' && typed !== 'tareas' && typed !== 'sesion') {
       return {
-        text: 'Uso: /agentes (abre el panel), /agentes tareas, /agentes rutas y /agentes sesion (lo abren en esa pestaña), /agentes cerrar, /agentes limpiar.',
+        text: 'Uso: /agentes (abre el panel), /agentes tareas, /agentes rutas y /agentes sesion (lo abren en esa pestaña), /agentes cache si|no, /agentes cerrar, /agentes limpiar.',
       }
     }
 
@@ -1569,6 +1840,7 @@ const registrarAgentes = (on: On): void => {
 
   // Cada prompt del hilo principal es una tarea; se guardan solo las que lanzaron algún agente.
   on('turn.start', async ($, e, next) => {
+    enTurno = true
     const inicio = await $.clock.now()
     const usadas = new Set((await read($, agentes)).map(agente => agente.tarea))
     await update($, tareas, list => [
@@ -1639,6 +1911,10 @@ const registrarAgentes = (on: On): void => {
 
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId
+
+    if (id === undefined) {
+      enTurno = false
+    }
 
     if (id !== undefined) {
       const fin = await $.clock.now()
@@ -1713,6 +1989,7 @@ export const register: Register = on => {
 
     // Solo donde hay alguien mirando la banda.
     interactiva = e.isInteractive
+    armarLatido($).catch(() => undefined)
     consultado = 0
     sinConsulta = false
 
@@ -1768,6 +2045,7 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    const inicio = e.agentId === undefined ? await $.clock.now() : 0
     const sent = await enrutarPaso($, e)
     const response = yield* next(sent)
     const usage = response.usage
@@ -1784,6 +2062,7 @@ export const register: Register = on => {
       if (e.agentId === undefined) {
         const tokens = enviado(usage)
         await update($, contexto, () => tokens)
+        await observarCache($, inicio, usage)
       }
     }
 
@@ -1818,6 +2097,7 @@ export const register: Register = on => {
       const after = done.tokensAfter
       await update($, contexto, () => after ?? null)
       await anotarCompactacion($, { antes: done.tokensBefore ?? null, despues: after ?? null })
+      prefijoNuevo = true
       historiar($).catch(() => undefined)
     }
 
@@ -1838,6 +2118,8 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    pararLatido()
+
     if (e.reason === 'clear' || e.reason === 'resume') {
       await update($, gastados, () => 0)
       await update($, contexto, () => null)

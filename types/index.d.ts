@@ -37,6 +37,17 @@ export type Compactacion = {
   fichero: string | null
 }
 
+// La caché de la conversación: si se mantiene viva en las pausas, cuánto se ha visto que dura, cuándo
+// empezó la última petición que la renovó y lo hecho para mantenerla.
+export type Cache = {
+  viva: boolean
+  ttl: 'sin confirmar' | '1h' | '5m'
+  ultima: number | null
+  latidos: number
+  leido: number
+  nota: string | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'tokens-sesion': {
@@ -61,6 +72,7 @@ declare module 'claude-code' {
       compactaciones: Compactacion[]
       nacida: number | null
       historico: string | null
+      cache: Cache
       pasos: Paso[]
     }
   }

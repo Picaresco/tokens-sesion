@@ -43,6 +43,9 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
   const tools: string[] = []
   // Lo que el mod escribe en el proyecto.
   const writes: { path: string; text: string }[] = []
+  // Las consultas sobre la propia conversación (los latidos de la caché) y los comandos que el mod lanza.
+  const forks: string[] = []
+  const ran: string[] = []
   const state = {
     cost: null as TurnUsage | null,
     index: 0,
@@ -60,6 +63,8 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     turns: 0,
     usd: undefined as number | undefined,
     limits: [] as SessionRateLimit[],
+    // Lo que un latido lee de caché: 0 es que ya no estaba.
+    forkRead: 0,
   }
 
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -116,7 +121,27 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
   )
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'x', scope: 'shared' as const }] }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('command.run', () => ({ text: '' }))
+  on('command.run', (_$, e) => {
+    ran.push(e.command)
+
+    return { text: '' }
+  })
+  on('model.fork', (_$, e) => {
+    forks.push(e.prompt)
+
+    return {
+      value: {
+        isAnswered: true as const,
+        text: 'ok',
+        usage: {
+          input_tokens: 14,
+          output_tokens: 4,
+          cache_read_input_tokens: state.forkRead,
+          cache_creation_input_tokens: 36,
+        },
+      },
+    }
+  })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('turn.step', async function* (_$, e) {
@@ -171,6 +196,8 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     steps,
     tools,
     writes,
+    forks,
+    ran,
     state,
     // Acaba un turno del hilo principal.
     turn: () =>
@@ -984,4 +1011,154 @@ test('cada compactación queda en la pestaña Sesión y en el histórico con lo 
   const history = writes.findLast(write => write.path.includes('/historial/'))?.text ?? ''
   expect(history).toContain('- Compactaciones: 1')
   expect(history).toContain(`- ${hora(NOW)} · 650.000 → 40.000 tokens · ${summary}`)
+})
+
+const MIN = 60_000
+// El latido sale 52 minutos después de la última petición que renovó la caché.
+const LATIDO_MS = 52 * MIN
+
+// Dos peticiones del hilo principal separadas diez minutos: la segunda lee de caché `contexto`
+// tokens, con lo que queda visto que la caché dura una hora.
+const confirmar = async (w: ReturnType<typeof world>, contexto: number) => {
+  await w.ask(usage(10, 5, contexto, 0))
+  await w.clock.advance(10 * MIN)
+  await w.ask(usage(10, 5, 0, contexto))
+}
+
+test('la caché viva viene desactivada: en las pausas no se hace nada', async ($, on) => {
+  const w = world($, on)
+  await w.start()
+  await confirmar(w, 500_000)
+  await w.clock.advance(3 * 60 * MIN)
+  expect(w.forks).toEqual([])
+  expect(w.ran).toEqual([])
+})
+
+test('activada, espera a ver que la caché dura una hora antes de mantenerla', async ($, on) => {
+  // Con una sola petición aún no se sabe cuánto dura.
+  const other = world($, on, { cacheViva: true })
+  await other.start()
+  await other.ask(usage(10, 5, 500_000, 0))
+  await other.clock.advance(3 * 60 * MIN)
+  expect(other.forks).toEqual([])
+  expect(await session($)).toContain('Plan         empieza cuando se confirme que dura 1 hora')
+})
+
+test('con mucho contexto mantiene la caché hasta que compactar sale más barato, compacta y para', async ($, on) => {
+  const w = world($, on, { cacheViva: true })
+  w.state.forkRead = 500_000
+  await w.start()
+  await confirmar(w, 500_000)
+  expect(await session($)).toContain('Duración     1 hora')
+  expect(await session($)).toContain(`Caduca       a las ${hora(NOW + 70 * MIN).slice(0, 5)}`)
+  expect(await session($)).toContain('Plan         mantenerla hasta 11 h de pausa; después, compactar')
+
+  // Nada hasta poco antes de caducar; luego, una consulta mínima por hora.
+  await w.clock.advance(LATIDO_MS - MIN)
+  expect(w.forks).toEqual([])
+  await w.clock.advance(MIN)
+  expect(w.forks).toEqual(['Responde solo con la palabra: ok'])
+
+  for (let n = 2; n <= 11; n++) {
+    await w.clock.advance(LATIDO_MS)
+    expect(w.forks).toHaveLength(n)
+  }
+
+  expect(w.ran).toEqual([])
+  expect(await session($)).toContain('Leído        5.500.000 tokens de caché en mantenerla')
+
+  // A la duodécima hora lo pagado iguala lo que cuesta compactar: compacta una vez y no hace más.
+  await w.clock.advance(LATIDO_MS)
+  expect(w.forks).toHaveLength(11)
+  expect(w.ran).toEqual(['compact'])
+  await w.clock.advance(5 * LATIDO_MS)
+  expect(w.forks).toHaveLength(11)
+  expect(w.ran).toEqual(['compact'])
+  expect((await session($)).some(line => line.includes('salía más barato compactar'))).toBe(true)
+})
+
+test('con poco contexto la mantiene hasta el tope de latidos y después la deja caducar, sin compactar', async ($, on) => {
+  const w = world($, on, { cacheViva: true })
+  w.state.forkRead = 100_000
+  await w.start()
+  await confirmar(w, 100_000)
+  expect(await session($)).toContain('Plan         mantenerla hasta 12 h de pausa; después, dejarla caducar')
+
+  await w.clock.advance(20 * LATIDO_MS)
+  expect(w.forks).toHaveLength(12)
+  expect(w.ran).toEqual([])
+  expect((await session($)).some(line => line.includes('sale más barato dejarla caducar'))).toBe(true)
+})
+
+test('si un latido ya no encuentra la caché deja de intentarlo, y al volver a trabajar empieza otra pausa', async ($, on) => {
+  const w = world($, on, { cacheViva: true })
+  w.state.forkRead = 500_000
+  await w.start()
+  await confirmar(w, 500_000)
+  await w.clock.advance(2 * LATIDO_MS)
+  expect(w.forks).toHaveLength(2)
+
+  // La persona vuelve: la cuenta de la pausa empieza de cero.
+  await w.ask(usage(10, 5, 0, 500_000))
+  w.state.forkRead = 0
+  await w.clock.advance(LATIDO_MS)
+  expect(w.forks).toHaveLength(3)
+  await w.clock.advance(4 * LATIDO_MS)
+  expect(w.forks).toHaveLength(3)
+  expect((await session($)).some(line => line.includes('La caché ya no estaba'))).toBe(true)
+
+  // Con un turno en marcha no hay pausa que cubrir.
+  w.state.forkRead = 500_000
+  await w.prompt('tarea larga')
+  await w.ask(usage(10, 5, 0, 500_000))
+  await w.clock.advance(3 * LATIDO_MS)
+  expect(w.forks).toHaveLength(3)
+})
+
+test('si la caché resulta ser de cinco minutos no se mantiene', async ($, on) => {
+  const w = world($, on, { cacheViva: true })
+  await w.start()
+  await w.ask(usage(10, 5, 500_000, 0))
+  await w.clock.advance(10 * MIN)
+  // A los diez minutos hay que escribirla otra vez: no duró.
+  await w.ask(usage(10, 5, 500_000, 0))
+  await w.clock.advance(3 * 60 * MIN)
+
+  expect(w.forks).toEqual([])
+  const drawn = await session($)
+  expect(drawn).toContain('Duración     5 minutos')
+  expect(drawn).toContain('Plan         con caché de 5 minutos no compensa mantenerla')
+})
+
+test('la caché viva se activa con el botón de la pestaña Sesión o con el comando, y queda guardada', async ($, on) => {
+  const w = world($, on)
+  await w.start()
+  await w.slash('sesion')
+  const ui = await $.ui.mount({
+    plugin: 'tokens-sesion',
+    component: 'Pane',
+    requestId: 'agentes',
+    surface: 'terminal',
+    props: {
+      title: 'Agentes',
+      isFocused: false,
+      bodyColumns: 48,
+      placement: 'dock',
+      scroll: { offset: 0, bodyRows: 60 },
+      view: {},
+    },
+  })
+  expect((await ui.find({ key: 'cache-viva' }))?.props.label).toBe('no')
+
+  await ui.press({ key: 'cache-viva' })
+  await w.settle()
+  expect(w.store.cacheViva).toBe(true)
+  expect((await ui.find({ key: 'cache-viva' }))?.props.label).toBe('sí')
+
+  expect((await w.slash('cache no')).text).toContain('desactivada')
+  expect(w.store.cacheViva).toBe(false)
+  expect((await ui.find({ key: 'cache-viva' }))?.props.label).toBe('no')
+  expect((await w.slash('cache si')).text).toContain('activada')
+  expect(w.store.cacheViva).toBe(true)
+  await ui.unmount()
 })
