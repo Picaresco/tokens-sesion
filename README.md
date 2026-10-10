@@ -3,7 +3,8 @@
 Una banda sobre el prompt que enseña **cuánto contexto llevas**, hace que la sesión
 **se compacte sola donde tú marques** (también a mitad de una tarea larga) y **guarda
 el resumen** de cada compactación. Y un **panel lateral con los subagentes** de cada
-tarea (inicio, fin y tokens) donde eliges **con qué modelo y esfuerzo** arranca cada tipo.
+tarea (inicio, fin y tokens), **el plan del trabajo paso a paso** con lo que tardó cada uno,
+y dónde eliges **con qué modelo y esfuerzo** arranca cada tipo de agente.
 
 ```
 Contexto: 222.807 tokens ████████●░░░░░░░░░░░░░░░░░┃░░░░░░░░░░░░░ · sesión: 2.431.870 · CPU 23% · RAM 61%
@@ -41,6 +42,20 @@ claude plugin install tokens-sesion@tokens-sesion
 El plugin se llama `tokens-sesion` (el nombre con el que nació, cuando solo era la banda);
 el repositorio, `Plugin-Work`. Probado con Claude Code 2.1.296.
 
+### Si ya lo tenías instalado
+
+No hay que desinstalar nada: es una actualización.
+
+```
+claude plugin marketplace update tokens-sesion
+claude plugin update tokens-sesion@tokens-sesion
+```
+
+Después, `/reload-plugins` en la sesión abierta. Si al seguir la orden de instalación sale
+«Cannot add marketplace "tokens-sesion": its source doesn't match…», es que ya tenías el
+marketplace con la dirección antigua del repositorio (`Picaresco/tokens-sesion`, que sigue
+funcionando): cancela y usa las dos órdenes de arriba.
+
 ## Qué enseña la banda
 
 | Parte | Qué es |
@@ -77,11 +92,11 @@ todas tus sesiones y proyectos.
 
 ## Panel de agentes
 
-Un panel lateral con dos pestañas, que se eligen con los botones de arriba (o con las
-teclas `1` y `2` cuando el panel tiene el teclado):
+Un panel lateral con tres pestañas, que se eligen con los botones de arriba (o con las
+teclas `1`, `2` y `3` cuando el panel tiene el teclado):
 
 ```
-[ Agentes ]  [ Enrutadores ]
+[ Agentes ]  [ Tareas ]  [ Enrutadores ]
 ────────────────────────────────────────────────
 Tarea 3 · 12:30:58 · 2 agentes · 21.520 tok
 busca los hooks del mod y revisa los tests
@@ -95,6 +110,33 @@ busca los hooks del mod y revisa los tests
 prompt tuyo que lanza alguno), la más reciente arriba: hora de inicio, hora de fin,
 duración y tokens, que suben en vivo, con el total de la tarea. `●` en curso, `✓`
 terminado, `✗` abortado o con error. Los tokens se cuentan igual que `sesión:` en la banda.
+
+**Tareas** es el plan del trabajo en curso: los pasos que Claude se marca, cada uno con
+su estado y lo que tardó.
+
+```
+[ Agentes ]  [ Tareas ]  [ Enrutadores ]
+────────────────────────────────────────────────
+█████████████░░░░░░░ 2/3 · 16m10s
+✓ 2 hechas · ● 1 en curso · ○ 0 pendientes
+
+✓ Leer el código
+  12:31 → 12:33   2m05s
+✓ Escribir la pestaña
+  12:33 → 12:47  14m05s
+● Probar en una sesión real
+  12:47 → en curso
+```
+
+Verde y tachado lo hecho, amarillo y en negrita lo que está en curso, gris lo pendiente.
+El tiempo de un paso es el que pasa «en curso»: si vuelve a pendiente y se retoma, se
+suma. Arriba, la barra de avance y el tiempo total.
+
+Los pasos salen de la lista de tareas de Claude Code (`TodoWrite`, o `TaskCreate` y
+`TaskUpdate`). Donde el modelo no tiene esa lista, el mod le da una herramienta propia
+(`plan`) y le pide en el prompt de sistema que la use en trabajos de tres pasos o más:
+son unas líneas más de prompt y una llamada corta por cada cambio de estado. Solo en
+sesiones interactivas, y solo cuenta el plan del hilo principal, no el de los subagentes.
 
 **Enrutadores** es una tabla con una fila por tipo de agente (los de Claude Code, los
 de tus plugins y los tuyos) y otra para «Los demás». En cada fila eliges el **modelo**
@@ -110,8 +152,8 @@ momento y se guarda para todas tus sesiones y proyectos.
 - El esfuerzo solo se cambia en los modelos que lo admiten.
 
 El panel se abre solo con el primer agente de la sesión si el terminal es ancho (desde
-144 columnas). Con `/agentes` se abre a cualquier ancho, `/agentes rutas` lo abre en
-Enrutadores, `/agentes cerrar` lo cierra y `/agentes limpiar` vacía el registro. Si lo
+144 columnas). Con `/agentes` se abre a cualquier ancho, `/agentes tareas` y `/agentes rutas` lo abren
+en esa pestaña, `/agentes cerrar` lo cierra y `/agentes limpiar` vacía el registro y el plan. Si lo
 cierras, no vuelve a abrirse solo hasta que lo pidas. El registro dura lo que la sesión.
 
 ## Qué toca en tu equipo
@@ -124,6 +166,8 @@ cierras, no vuelve a abrirse solo hasta que lo pidas. El registro dura lo que la
   arrancar la sesión y, como mucho, cada 5 minutos: de ahí sale el límite semanal propio de cada
   modelo. Tarda unos 3 segundos, no llama al modelo, no carga tus plugins ni servidores MCP y no
   guarda sesión. Si tu plan no tiene límites por modelo, se hace una sola vez.
+- **Una herramienta y unas líneas de prompt de sistema** para que Claude lleve el plan, solo
+  donde no tiene su propia lista de tareas y solo en sesiones interactivas.
 - **El modelo y el esfuerzo de los subagentes**, solo de los tipos a los que se lo pongas en
   la pestaña Enrutadores. Con todo en «heredar» (así viene) no cambia nada.
 - **Un `powershell.exe` oculto por sesión** (unos 85 MB) que lee el uso de CPU y RAM

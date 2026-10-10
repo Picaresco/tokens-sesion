@@ -32,6 +32,8 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
   const panes = new Set<string>()
   const spawns: AgentSpawnInput[] = []
   const steps: (string | number | undefined)[] = []
+  // Las herramientas que el mod registra.
+  const tools: string[] = []
   const state = {
     cost: null as TurnUsage | null,
     index: 0,
@@ -41,6 +43,9 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     effort: undefined as 'high' | undefined,
     // Los agentes que el motor lista: [id, tipo].
     listed: [] as [string, string][],
+    // Las herramientas de lista de tareas que el motor ofrece al modelo, y el id de la próxima que cree.
+    builtin: ['TodoWrite'] as string[],
+    taskId: '1',
   }
 
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -59,6 +64,21 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
   }))
   on('ui.toast', () => ({ value: undefined }))
+  on('tool.list', () => ({
+    value: ['Read', ...state.builtin].map(name => ({ name, description: '', mcp: false })),
+  }))
+  on('tool.register', (_$, e) => {
+    tools.push(e.name)
+
+    return { value: { tool: `mcp__tokens-sesion__${e.name}` } }
+  })
+  // Como el motor: cada herramienta devuelve su registro.
+  on('tool.call', (_$, e) =>
+    e.tool === 'TaskCreate'
+      ? { result: { task: { id: state.taskId, subject: e.subject } } }
+      : ({ result: {} } as never),
+  )
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'x', scope: 'shared' as const }] }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('command.run', () => ({ text: '' }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
@@ -113,7 +133,15 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     closed,
     spawns,
     steps,
+    tools,
     state,
+    // El modelo anota su lista de tareas entera: [texto, estado] por paso.
+    todo: (list: [string, 'pending' | 'in_progress' | 'completed'][], agentId?: string) =>
+      $.tool.call({
+        tool: 'TodoWrite',
+        todos: list.map(([content, status]) => ({ content, status, activeForm: content })),
+        ...(agentId === undefined ? {} : { agentId }),
+      }),
     // Deja que el mod acabe lo que tenga entre manos.
     settle: () => clock.settle(),
     start: (isInteractive = true) =>
@@ -337,7 +365,7 @@ test('el comando abre, cierra y vacía; cerrado no vuelve a abrirse solo', async
   expect(opened).toEqual(['agentes', 'agentes'])
   expect(await lines($)).toHaveLength(2 + 3 * 2)
 
-  expect((await slash('limpiar')).text).toBe('Registro de agentes vaciado.')
+  expect((await slash('limpiar')).text).toBe('Registro de agentes y plan de tareas vaciados.')
   expect(await lines($)).toEqual(['Sin agentes todavía.'])
   expect((await slash('otra cosa')).text).toContain('Uso: /agentes')
 })
@@ -528,7 +556,7 @@ test('en el móvil, sin selectores, la tabla se lee', async ($, on) => {
   await ui.unmount()
 })
 
-test('un solo panel con dos pestañas: el botón de cada una enseña la suya, y /agentes rutas abre en Enrutadores', async ($, on) => {
+test('un solo panel con sus pestañas: el botón de cada una enseña la suya, y /agentes rutas abre en Enrutadores', async ($, on) => {
   const { start, prompt, spawn, slash, opened, closed, settle } = world($, on)
   await start()
   await settle()
@@ -559,6 +587,7 @@ test('un solo panel con dos pestañas: el botón de cada una enseña la suya, y 
 
   expect(await tabs()).toEqual([
     ['Agentes', 'primary'],
+    ['Tareas', 'secondary'],
     ['Enrutadores', 'secondary'],
   ])
   expect(await ui.find({ type: 'Text', text: 'Tarea 1' })).toBeDefined()
@@ -568,6 +597,7 @@ test('un solo panel con dos pestañas: el botón de cada una enseña la suya, y 
   await settle()
   expect(await tabs()).toEqual([
     ['Agentes', 'secondary'],
+    ['Tareas', 'secondary'],
     ['Enrutadores', 'primary'],
   ])
   expect(await ui.find({ type: 'Text', text: 'Tarea 1' })).toBeUndefined()
@@ -584,4 +614,192 @@ test('un solo panel con dos pestañas: el botón de cada una enseña la suya, y 
   expect(await ui.find({ key: 'modelo:Explore' })).toBeDefined()
   expect(opened).toEqual(['agentes', 'agentes', 'agentes'])
   await ui.unmount()
+})
+
+// La pestaña Tareas tal como se dibuja, línea a línea.
+const plan = async ($: Engine, bodyColumns = 48): Promise<string[]> => {
+  await $.command.run({
+    command: 'agentes',
+    args: 'tareas',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+
+  return lines($, bodyColumns)
+}
+
+const hhmm = (ms: number) => hora(ms).slice(0, 5)
+
+test('sin plan la pestaña Tareas lo dice', async ($, on) => {
+  const { start } = world($, on)
+  await start()
+
+  expect(await plan($)).toEqual(['Sin plan todavía.', 'Aparece cuando Claude reparte el trabajo en pasos.'])
+})
+
+test('la lista de tareas del motor se ve con sus tres estados, la hora y lo que tardó cada paso', async ($, on) => {
+  const { start, clock, todo } = world($, on)
+  await start()
+  await todo([
+    ['Leer el código', 'in_progress'],
+    ['Escribir la pestaña', 'pending'],
+    ['Probar', 'pending'],
+  ])
+  expect(await plan($)).toEqual([
+    '░'.repeat(20) + ' 0/3',
+    '✓ 0 hechas · ● 1 en curso · ○ 2 pendientes',
+    ' ',
+    '● Leer el código',
+    `  ${hhmm(NOW)} → en curso`,
+    '○ Escribir la pestaña',
+    '○ Probar',
+  ])
+
+  await clock.advance(125_000)
+  await todo([
+    ['Leer el código', 'completed'],
+    ['Escribir la pestaña', 'in_progress'],
+    ['Probar', 'pending'],
+  ])
+  await clock.advance(60_000)
+  // Lo que anota un subagente en su propia lista no es el plan.
+  await todo([['cosa del subagente', 'in_progress']], 'a1')
+  // Un paso que vuelve a pendiente guarda lo que llevaba; uno hecho sin pasar por en curso no tiene duración.
+  await todo([
+    ['Leer el código', 'completed'],
+    ['Escribir la pestaña', 'pending'],
+    ['Probar', 'completed'],
+  ])
+
+  expect(await plan($)).toEqual([
+    '█'.repeat(13) + '░'.repeat(7) + ' 2/3 · 3m05s',
+    '✓ 2 hechas · ● 0 en curso · ○ 1 pendientes',
+    ' ',
+    '✓ Leer el código',
+    `  ${hhmm(NOW)} → ${hhmm(NOW + 125_000)}   2m05s`,
+    '○ Escribir la pestaña',
+    '  pausado  1m00s',
+    '✓ Probar',
+    `  hecho ${hhmm(NOW + 185_000)}`,
+  ])
+
+  // Con sitio, el paso y su tiempo van en una fila.
+  expect((await plan($, 100))[3]).toBe(
+    `✓ Leer el código ${`${hhmm(NOW)} → ${hhmm(NOW + 125_000)}   2m05s`.padStart(23)}`,
+  )
+})
+
+test('cada estado va con su color: verde lo hecho, amarillo lo que está en curso y gris lo pendiente', async ($, on) => {
+  const { start, todo, slash } = world($, on)
+  await start()
+  await todo([
+    ['uno', 'completed'],
+    ['dos', 'in_progress'],
+    ['tres', 'pending'],
+  ])
+  await slash('tareas')
+  const ui = await $.ui.mount({
+    plugin: 'tokens-sesion',
+    component: 'Pane',
+    requestId: 'agentes',
+    surface: 'terminal',
+    props: {
+      title: 'Agentes',
+      isFocused: false,
+      bodyColumns: 48,
+      placement: 'dock',
+      scroll: { offset: 0, bodyRows: 40 },
+      view: {},
+    },
+  })
+  const color = async (text: string) =>
+    (await ui.findAll({ type: 'Text' })).find(one => one.text === text)?.props
+
+  expect(await color('uno')).toMatchObject({ color: 'success', strikethrough: true })
+  expect(await color('dos')).toMatchObject({ color: 'warning', bold: true })
+  expect(await color('tres')).toMatchObject({ color: 'inactive' })
+  expect(
+    (await ui.findAll({ type: 'Button' }))
+      .filter(button => button.key?.startsWith('pestana:'))
+      .map(button => [button.props.label, button.props.variant]),
+  ).toEqual([
+    ['Agentes', 'secondary'],
+    ['Tareas', 'primary'],
+    ['Enrutadores', 'secondary'],
+  ])
+  await ui.unmount()
+})
+
+test('las tareas creadas y actualizadas de una en una también forman el plan', async ($, on) => {
+  const { start, clock, state, slash } = world($, on)
+  await start()
+  state.taskId = '7'
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Migrar la base', description: 'x' })
+  state.taskId = '8'
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Avisar al equipo', description: 'x' })
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '7', status: 'in_progress' })
+  await clock.advance(42_000)
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '7', status: 'completed', subject: 'Migrar la base de datos' })
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '8', status: 'deleted' })
+  // Una tarea de antes de cargar el mod entra con su primera actualización.
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '3', status: 'in_progress' })
+
+  expect((await plan($)).slice(3)).toEqual([
+    '✓ Migrar la base de datos',
+    `  ${hhmm(NOW)} → ${hhmm(NOW + 42_000)}     42s`,
+    '● Tarea 3',
+    `  ${hhmm(NOW + 42_000)} → en curso`,
+  ])
+
+  expect((await slash('limpiar')).text).toBe('Registro de agentes y plan de tareas vaciados.')
+  expect((await plan($))[0]).toBe('Sin plan todavía.')
+})
+
+test('donde el modelo no tiene lista de tareas, el mod le da la herramienta del plan y se lo dice en el prompt', async ($, on) => {
+  const { start, state, tools, clock } = world($, on)
+  state.builtin = []
+  await start()
+  expect(tools).toEqual(['plan'])
+
+  const compose = (offered: string[]) =>
+    $.prompt.compose({
+      model: 'claude-opus-5-5',
+      promptModel: 'claude-opus-5-5',
+      surfaces: ['terminal'],
+      tools: offered,
+      outputStyle: null,
+      traits: [],
+    })
+  expect((await compose(['Read', 'mcp__tokens-sesion__plan'])).sections.map(section => section.id)).toEqual([
+    'intro',
+    'tokens-sesion:plan',
+  ])
+  expect((await compose(['Read'])).sections.map(section => section.id)).toEqual(['intro'])
+
+  const call = (pasos: unknown) => $.tool.call({ tool: 'mcp__tokens-sesion__plan', pasos })
+  expect((await call([{ texto: 'Medir', estado: 'en_curso' }, { texto: 'Arreglar', estado: 'pendiente' }])).result).toBe(
+    'Plan guardado: 0 de 2 pasos hechos.',
+  )
+  await clock.advance(9_000)
+  await call([{ texto: 'Medir', estado: 'hecho' }, { texto: 'Arreglar', estado: 'en_curso' }])
+  // Lo que no vale no se guarda, y el modelo lee por qué.
+  expect((await call([{ texto: 'Medir', estado: 'casi' }])).result).toContain('No guardado')
+  expect((await call('todo')).result).toContain('No guardado')
+
+  expect((await plan($)).slice(3)).toEqual([
+    '✓ Medir',
+    `  ${hhmm(NOW)} → ${hhmm(NOW + 9_000)}      9s`,
+    '● Arreglar',
+    `  ${hhmm(NOW + 9_000)} → en curso`,
+  ])
+})
+
+test('con la lista de tareas del motor, o sin nadie delante, no se añade la herramienta del plan', async ($, on) => {
+  const first = world($, on)
+  await first.start()
+  expect(first.tools).toEqual([])
+
+  first.state.builtin = []
+  await first.start(false)
+  expect(first.tools).toEqual([])
 })

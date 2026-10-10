@@ -10,7 +10,7 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { Agente, Ruta } from '../types'
+import type { Agente, Paso, Ruta } from '../types'
 
 // Cada tramo se pinta con su color hasta `hasta` tokens de contexto, incluido; por encima del último, ROJO.
 const TRAMOS = [
@@ -417,12 +417,13 @@ const leer = async ($: EngineInterface): Promise<void> => {
 // ---------------------------------------------------------------------------------------------
 // Panel de agentes: registro de los agentes de cada tarea y modelo y esfuerzo por tipo de agente.
 // ---------------------------------------------------------------------------------------------
-// Un solo panel con dos pestañas: arriba, un botón por cada una; debajo, la elegida.
+// Un solo panel con tres pestañas: arriba, un botón por cada una; debajo, la elegida.
 const PANEL = 'agentes'
 const TITULO = 'Agentes'
 const PESTANAS = [
   { id: 'agentes', titulo: 'Agentes', tecla: '1' },
-  { id: 'enrutadores', titulo: 'Enrutadores', tecla: '2' },
+  { id: 'tareas', titulo: 'Tareas', tecla: '2' },
+  { id: 'enrutadores', titulo: 'Enrutadores', tecla: '3' },
 ] as const
 const COMANDO_AGENTES = 'agentes'
 
@@ -453,8 +454,8 @@ const ANCHO_RUTA = 44
 
 // El registro guarda los últimos MAX_AGENTES agentes y las tareas que los lanzaron.
 const MAX_AGENTES = 200
-// De cada tarea se enseña el principio de su prompt.
-const TEXTO_TAREA = 120
+// De cada tarea se enseña el principio de su prompt; nada se corta a lo ancho: lo que no cabe sigue en la línea de abajo.
+const TEXTO_TAREA = 300
 
 // Columnas de cada parte de la línea de un agente: «✓ 12:31:05 → 12:32:47» y «  1m42s    18.420 tok».
 // Con ANCHO_LINEA todo va en una línea; con ANCHO_CIFRAS, horas y cifras juntas y el agente debajo;
@@ -621,7 +622,7 @@ const dibujarAgentes = async (
     }
 
     filas.push(
-      <Text bold wrap="truncate-end">
+      <Text bold wrap="wrap">
         {cabecera ? `Tarea ${n} · ${hora(cabecera.inicio)}` : 'Antes de la primera tarea'}
         {` · ${cuantos} · ${conPuntos(total)} tok`}
       </Text>,
@@ -629,7 +630,7 @@ const dibujarAgentes = async (
 
     if (cabecera && cabecera.texto !== '') {
       filas.push(
-        <Text dimColor italic wrap="truncate-end">
+        <Text dimColor italic wrap="wrap">
           {cabecera.texto}
         </Text>,
       )
@@ -655,9 +656,10 @@ const dibujarAgentes = async (
         </Text>
       )
 
-      if (ancho >= ANCHO_LINEA) {
+      // En una sola línea solo si cabe entera; si no, el agente va debajo, en las líneas que necesite.
+      if (ancho >= ANCHO_LINEA && ancho >= ANCHO_CIFRAS + 2 + quien.length) {
         filas.push(
-          <Text wrap="truncate-end">
+          <Text>
             {cabeza}
             {`  ${cifras}  `}
             <Text dimColor>{quien}</Text>
@@ -678,9 +680,14 @@ const dibujarAgentes = async (
       }
 
       filas.push(
-        <Text dimColor wrap="truncate-end">
-          {`  ${quien}`}
-        </Text>,
+        <Box flexDirection="row">
+          <Text>{'  '}</Text>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text dimColor wrap="wrap">
+              {quien}
+            </Text>
+          </Box>
+        </Box>,
       )
     }
   }
@@ -801,18 +808,354 @@ const dibujarRutas = async (
   )
 }
 
+// ---------------------------------------------------------------------------------------------
+// Pestaña Tareas: los pasos del plan que Claude lleva durante el trabajo, con lo que tardó cada uno.
+// ---------------------------------------------------------------------------------------------
+// Salen de la lista de tareas del motor (TodoWrite, o TaskCreate y TaskUpdate). Donde el modelo no
+// tiene ninguna de las dos, el mod le da una herramienta propia y le pide en el prompt que la use.
+const PLAN = 'plan'
+const PLAN_COMPLETO = 'mcp__tokens-sesion__plan'
+const SECCION_PLAN = 'tokens-sesion:plan'
+const TEXTO_PLAN = [
+  '# Plan de la tarea',
+  `En un trabajo de tres pasos o más, llama a ${PLAN_COMPLETO} con la lista completa de pasos antes de empezar,`,
+  'y otra vez cada vez que un paso cambie de estado (pendiente, en_curso, hecho): la persona lo sigue en un panel.',
+  'Un solo paso en_curso a la vez; márcalo hecho en cuanto acabe, no al final. Pasos cortos, en imperativo.',
+  'No la uses para una pregunta ni para un cambio de un solo paso.',
+].join('\n')
+const MAX_PASOS = 200
+const ESTADOS_PASO = {
+  hecho: { signo: '✓', color: 'success' },
+  'en curso': { signo: '●', color: 'warning' },
+  pendiente: { signo: '○', color: 'inactive' },
+} as const
+// Columnas de la barra de avance, y de la cola de cada paso: « 12:31 → 12:45  14m05s».
+const BARRA_PASOS = 20
+const COLA_PASO = 23
+
+const pasos = atom({ plugin: 'tokens-sesion', key: 'pasos' } as const, [])
+
+const horaCorta = (ms: number): string => hora(ms).slice(0, 5)
+
+// El paso al entrar en `estado`: el tiempo que cuenta es el que pasa en curso, sumado si vuelve a estarlo.
+const mover = (paso: Paso, estado: Paso['estado'], now: number): Paso => {
+  if (paso.estado === estado) {
+    return paso
+  }
+
+  const ms = paso.desde === null ? paso.ms : paso.ms + (now - paso.desde)
+
+  if (estado === 'en curso') {
+    return { ...paso, estado, inicio: paso.inicio ?? now, desde: now, fin: null }
+  }
+
+  return { ...paso, estado, ms, desde: null, fin: estado === 'hecho' ? now : null }
+}
+
+const pasoNuevo = (id: string, texto: string): Paso => ({
+  id,
+  texto,
+  estado: 'pendiente',
+  inicio: null,
+  fin: null,
+  ms: 0,
+  desde: null,
+})
+
+// La lista entera llega de una vez: cada paso conserva sus tiempos si sigue con el mismo texto.
+const sincronizar = (
+  list: readonly Paso[],
+  nuevos: readonly { texto: string; estado: Paso['estado'] }[],
+  now: number,
+): Paso[] => {
+  const libres = [...list]
+
+  return nuevos.slice(0, MAX_PASOS).map((nuevo, n) => {
+    const i = libres.findIndex(paso => paso.texto === nuevo.texto)
+    const previo = i < 0 ? pasoNuevo(`p${now}-${n}`, nuevo.texto) : libres.splice(i, 1)[0]!
+
+    return mover(previo, nuevo.estado, now)
+  })
+}
+
+const ESTADOS_MOTOR: Record<string, Paso['estado']> = {
+  pending: 'pendiente',
+  in_progress: 'en curso',
+  completed: 'hecho',
+  pendiente: 'pendiente',
+  en_curso: 'en curso',
+  hecho: 'hecho',
+}
+
+// Lo que llega a la herramienta propia lo escribe el modelo: se comprueba antes de guardarlo.
+const leerPlan = (value: unknown): { texto: string; estado: Paso['estado'] }[] | null => {
+  if (!Array.isArray(value)) {
+    return null
+  }
+
+  const list: { texto: string; estado: Paso['estado'] }[] = []
+
+  for (const item of value) {
+    const { texto, estado } = (item ?? {}) as { texto?: unknown; estado?: unknown }
+    const known = typeof estado === 'string' ? ESTADOS_MOTOR[estado] : undefined
+
+    if (typeof texto !== 'string' || texto.trim() === '' || known === undefined) {
+      return null
+    }
+
+    list.push({ texto: resumir(texto), estado: known })
+  }
+
+  return list
+}
+
+// Donde el modelo no tiene lista de tareas del motor, se le da la herramienta del plan.
+const ofrecerPlan = async ($: EngineInterface): Promise<void> => {
+  const names = (await $.tool.list()).map(tool => tool.name)
+
+  if (names.includes('TodoWrite') || names.includes('TaskCreate')) {
+    return
+  }
+
+  await $.tool.register({
+    name: PLAN,
+    description:
+      'Guarda el plan de la tarea en curso para que la persona lo siga en un panel: la lista completa de pasos, cada uno con su estado. Llámala al empezar un trabajo de varios pasos y cada vez que un paso cambie de estado.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pasos: {
+          type: 'array',
+          description: 'Todos los pasos del plan, en orden; sustituye a la lista anterior.',
+          items: {
+            type: 'object',
+            properties: {
+              texto: { type: 'string', description: 'El paso, corto y en imperativo.' },
+              estado: { type: 'string', enum: ['pendiente', 'en_curso', 'hecho'] },
+            },
+            required: ['texto', 'estado'],
+          },
+        },
+      },
+      required: ['pasos'],
+    },
+  })
+}
+
+const dibujarTareas = async (
+  $: EngineInterface,
+  e: RenderInput<'Pane'>,
+): Promise<RenderElement> => {
+  const { Box, Text } = $.ui.resolve(e)
+  const list = await read($, pasos)
+  const ancho = e.props.bodyColumns
+
+  if (list.length === 0) {
+    return (
+      <Box key="cuerpo" flexDirection="column">
+        <Text dimColor>Sin plan todavía.</Text>
+        <Text dimColor wrap="wrap">
+          Aparece cuando Claude reparte el trabajo en pasos.
+        </Text>
+      </Box>
+    )
+  }
+
+  const hechos = list.filter(paso => paso.estado === 'hecho').length
+  const enCurso = list.filter(paso => paso.estado === 'en curso').length
+  const pendientes = list.length - hechos - enCurso
+  const total = list.reduce((sum, paso) => sum + paso.ms, 0)
+  const llenas = Math.round((hechos / list.length) * BARRA_PASOS)
+  const filas: RenderElement[] = [
+    <Text>
+      <Text color="success">{'█'.repeat(llenas)}</Text>
+      <Text dimColor>{'░'.repeat(BARRA_PASOS - llenas)}</Text>
+      <Text bold>{` ${hechos}/${list.length}`}</Text>
+      {total > 0 ? ` · ${duracion(total)}` : ''}
+    </Text>,
+    <Text wrap="wrap">
+      <Text color="success">{`✓ ${hechos} hechas`}</Text>
+      {' · '}
+      <Text color="warning">{`● ${enCurso} en curso`}</Text>
+      {' · '}
+      <Text color="inactive">{`○ ${pendientes} pendientes`}</Text>
+    </Text>,
+    <Text> </Text>,
+  ]
+
+  for (const paso of list) {
+    const marca = ESTADOS_PASO[paso.estado]
+    const tiempo =
+      paso.estado === 'hecho'
+        ? paso.inicio === null
+          ? `hecho ${horaCorta(paso.fin ?? 0)}`
+          : `${horaCorta(paso.inicio)} → ${horaCorta(paso.fin ?? 0)}  ${duracion(paso.ms).padStart(6)}`
+        : paso.estado === 'en curso'
+          ? `${horaCorta(paso.inicio ?? 0)} → en curso${paso.ms > 0 ? `  +${duracion(paso.ms)}` : ''}`
+          : paso.ms > 0
+            ? `pausado  ${duracion(paso.ms)}`
+            : ''
+    const texto = (
+      <Text
+        color={marca.color}
+        bold={paso.estado === 'en curso'}
+        strikethrough={paso.estado === 'hecho'}
+        wrap="wrap"
+      >
+        {paso.texto}
+      </Text>
+    )
+
+    // Con sitio, el paso y su tiempo en una fila; sin él, el tiempo debajo.
+    if (ancho >= ANCHO_LINEA) {
+      filas.push(
+        <Box flexDirection="row">
+          <Text color={marca.color}>{`${marca.signo} `}</Text>
+          <Box flexGrow={1} flexShrink={1}>
+            {texto}
+          </Box>
+          <Text dimColor>{` ${tiempo.padStart(COLA_PASO)}`}</Text>
+        </Box>,
+      )
+      continue
+    }
+
+    filas.push(
+      <Box flexDirection="row">
+        <Text color={marca.color}>{`${marca.signo} `}</Text>
+        <Box flexGrow={1} flexShrink={1}>
+          {texto}
+        </Box>
+      </Box>,
+    )
+
+    if (tiempo !== '') {
+      filas.push(<Text dimColor>{`  ${tiempo}`}</Text>)
+    }
+  }
+
+  return (
+    <Box key="cuerpo" flexDirection="column">
+      {filas}
+    </Box>
+  )
+}
+
+// Los hooks de la pestaña Tareas: lo que el modelo anota en su lista, solo en el hilo principal.
+const registrarTareas = (on: On): void => {
+  on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
+    const ran = await next(e)
+
+    if (ran.deny === undefined && ran.isError !== true && e.agentId === undefined) {
+      const now = await $.clock.now()
+      const nuevos = e.todos.map(todo => ({
+        texto: resumir(todo.content),
+        estado: ESTADOS_MOTOR[todo.status] ?? 'pendiente',
+      }))
+      await update($, pasos, list => sincronizar(list, nuevos, now))
+    }
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
+    const ran = await next(e)
+
+    if (ran.deny === undefined && ran.isError !== true && e.agentId === undefined) {
+      const id = `t${ran.result.task.id}`
+      const texto = resumir(e.subject)
+      await update($, pasos, list =>
+        [...list.filter(paso => paso.id !== id), pasoNuevo(id, texto)].slice(-MAX_PASOS),
+      )
+    }
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
+    const ran = await next(e)
+
+    if (ran.deny === undefined && ran.isError !== true && e.agentId === undefined) {
+      const now = await $.clock.now()
+      const id = `t${e.taskId}`
+      const estado = e.status
+      const subject = e.subject
+
+      await update($, pasos, list => {
+        if (estado === 'deleted') {
+          return list.filter(paso => paso.id !== id)
+        }
+
+        // Una tarea creada antes de cargar el mod entra aquí por primera vez.
+        const known = list.some(paso => paso.id === id)
+        const todos = known ? list : [...list, pasoNuevo(id, resumir(subject ?? `Tarea ${e.taskId}`))]
+
+        return todos.map(paso => {
+          if (paso.id !== id) {
+            return paso
+          }
+
+          const renombrado = subject === undefined ? paso : { ...paso, texto: resumir(subject) }
+
+          return estado === undefined ? renombrado : mover(renombrado, ESTADOS_MOTOR[estado] ?? paso.estado, now)
+        })
+      })
+    }
+
+    return ran
+  })
+
+  on('tool.call', { tool: PLAN_COMPLETO }, async ($, e) => {
+    const nuevos = leerPlan((e as { pasos?: unknown }).pasos)
+
+    if (nuevos === null) {
+      return {
+        result:
+          'No guardado: `pasos` debe ser una lista de { texto, estado }, con estado pendiente, en_curso o hecho.',
+      }
+    }
+
+    if (e.agentId === undefined) {
+      const now = await $.clock.now()
+      await update($, pasos, list => sincronizar(list, nuevos, now))
+    }
+
+    const hechos = nuevos.filter(paso => paso.estado === 'hecho').length
+
+    return { result: `Plan guardado: ${hechos} de ${nuevos.length} pasos hechos.` }
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+
+    return e.tools.includes(PLAN_COMPLETO)
+      ? {
+          sections: [
+            ...composed.sections.filter(section => section.id !== SECCION_PLAN),
+            { id: SECCION_PLAN, text: TEXTO_PLAN, scope: 'session' as const },
+          ],
+        }
+      : composed
+  })
+}
+
 // Un plugin engancha cada evento una sola vez: el arranque de la sesión y las peticiones al modelo
 // son también de la banda, y sus hooks llaman a estas tres funciones.
 
 // Al arrancar la sesión (o recargar el mod): el comando y la tabla guardada.
-const arrancarAgentes = async ($: EngineInterface): Promise<void> => {
+const arrancarAgentes = async ($: EngineInterface, isInteractive: boolean): Promise<void> => {
   await $.command.register({
     name: COMANDO_AGENTES,
     description: 'Panel con los agentes de cada tarea: inicio, fin, duración y tokens',
-    argumentHint: '[rutas | cerrar | limpiar]',
+    argumentHint: '[tareas | rutas | cerrar | limpiar]',
   })
   const stored = validas(await $.store.get(CLAVE))
   await update($, rutas, () => stored)
+
+  // El plan solo interesa donde hay alguien mirando el panel.
+  if (isInteractive) {
+    await ofrecerPlan($).catch(() => undefined)
+  }
 }
 
 // La petición tal como debe salir: con el esfuerzo de la tabla si es de un agente y el modelo lo admite.
@@ -872,22 +1215,27 @@ const registrarAgentes = (on: On): void => {
     }
 
     if (typed === 'limpiar') {
+      await update($, pasos, () => [])
       await update($, agentes, () => [])
       await update($, tareas, () => [])
       sueltos.clear()
 
-      return { text: 'Registro de agentes vaciado.' }
+      return { text: 'Registro de agentes y plan de tareas vaciados.' }
     }
 
-    if (typed !== '' && typed !== 'rutas') {
+    if (typed !== '' && typed !== 'rutas' && typed !== 'tareas') {
       return {
-        text: 'Uso: /agentes (abre el panel), /agentes rutas (lo abre en la pestaña Enrutadores), /agentes cerrar, /agentes limpiar.',
+        text: 'Uso: /agentes (abre el panel), /agentes tareas y /agentes rutas (lo abren en esa pestaña), /agentes cerrar, /agentes limpiar.',
       }
     }
 
     await update($, oculto, () => false)
     if (typed === 'rutas') {
       await update($, pestana, () => 'enrutadores')
+    }
+
+    if (typed === 'tareas') {
+      await update($, pestana, () => 'tareas')
     }
 
     const opened = await abrir($)
@@ -992,7 +1340,12 @@ const registrarAgentes = (on: On): void => {
   on('ui.render', { component: 'Pane', requestId: PANEL }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const actual = await read($, pestana)
-    const cuerpo = actual === 'enrutadores' ? await dibujarRutas($, e) : await dibujarAgentes($, e)
+    const cuerpo =
+      actual === 'enrutadores'
+        ? await dibujarRutas($, e)
+        : actual === 'tareas'
+          ? await dibujarTareas($, e)
+          : await dibujarAgentes($, e)
 
     return (
       <Box flexDirection="column">
@@ -1019,6 +1372,7 @@ const registrarAgentes = (on: On): void => {
 
 export const register: Register = on => {
   registrarAgentes(on)
+  registrarTareas(on)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -1029,7 +1383,7 @@ export const register: Register = on => {
     await cargar($)
     // Al recargar el mod a media sesión el motor ya los tiene.
     await limitar($, (await $.session.usage()).rateLimits)
-    await arrancarAgentes($)
+    await arrancarAgentes($, e.isInteractive)
     const started = await next(e)
 
     // Solo donde hay alguien mirando la banda.

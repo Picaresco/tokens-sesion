@@ -18,6 +18,17 @@ export type Tarea = { n: number; inicio: number; texto: string }
 // El modelo y el esfuerzo que se da a un tipo de agente; `heredar` deja lo que el motor decida.
 export type Ruta = { modelo: string; esfuerzo: string }
 
+// Un paso del plan: `ms` es lo que lleva en curso ya cerrado y `desde`, cuándo entró en curso la última vez.
+export type Paso = {
+  id: string
+  texto: string
+  estado: 'pendiente' | 'en curso' | 'hecho'
+  inicio: number | null
+  fin: number | null
+  ms: number
+  desde: number | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'tokens-sesion': {
@@ -36,7 +47,8 @@ declare module 'claude-code' {
       oculto: boolean
       rutas: Record<string, Ruta>
       tipos: string[]
-      pestana: 'agentes' | 'enrutadores'
+      pestana: 'agentes' | 'tareas' | 'enrutadores'
+      pasos: Paso[]
     }
   }
 }
