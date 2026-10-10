@@ -29,6 +29,14 @@ export type Paso = {
   desde: number | null
 }
 
+// Una compactación de la sesión: lo que medía el contexto antes y después, y dónde quedó su resumen.
+export type Compactacion = {
+  hora: number
+  antes: number | null
+  despues: number | null
+  fichero: string | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'tokens-sesion': {
@@ -47,7 +55,12 @@ declare module 'claude-code' {
       oculto: boolean
       rutas: Record<string, Ruta>
       tipos: string[]
-      pestana: 'agentes' | 'tareas' | 'enrutadores'
+      pestana: 'agentes' | 'tareas' | 'enrutadores' | 'sesion'
+      deAgentes: number
+      cincoHoras: { pct: number; renueva: string | null } | null
+      compactaciones: Compactacion[]
+      nacida: number | null
+      historico: string | null
       pasos: Paso[]
     }
   }

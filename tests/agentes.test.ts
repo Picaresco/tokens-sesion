@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { AgentSpawnInput, On, TurnUsage } from 'claude-code'
+import type { AgentSpawnInput, On, SessionRateLimit, TurnUsage } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 // 2026-10-10 10:00:00 UTC
@@ -11,6 +11,13 @@ const hora = (ms: number) => {
   const date = new Date(ms)
 
   return `${dos(date.getHours())}:${dos(date.getMinutes())}:${dos(date.getSeconds())}`
+}
+
+// La fecha y hora del equipo, como las pinta el mod.
+const fechaLocal = (ms: number) => {
+  const date = new Date(ms)
+
+  return `${date.getFullYear()}-${dos(date.getMonth() + 1)}-${dos(date.getDate())} ${hora(ms).slice(0, 5)}`
 }
 
 const usage = (input: number, output: number, cacheWrite: number, cacheRead: number): TurnUsage => ({
@@ -34,6 +41,8 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
   const steps: (string | number | undefined)[] = []
   // Las herramientas que el mod registra.
   const tools: string[] = []
+  // Lo que el mod escribe en el proyecto.
+  const writes: { path: string; text: string }[] = []
   const state = {
     cost: null as TurnUsage | null,
     index: 0,
@@ -46,13 +55,40 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     // Las herramientas de lista de tareas que el motor ofrece al modelo, y el id de la próxima que cree.
     builtin: ['TodoWrite'] as string[],
     taskId: '1',
+    // Lo que el motor sabe de la sesión: cuándo empezó, sus turnos, su coste y los límites del plan.
+    started: 0,
+    turns: 0,
+    usd: undefined as number | undefined,
+    limits: [] as SessionRateLimit[],
   }
 
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   // Lo que pide la banda del mismo mod al arrancar: sin lector de CPU ni consulta de /usage.
   on('session.usage', () => ({
-    value: { startedAt: 0, context: { window: 1_000_000, tokens: 0 }, rateLimits: [] },
+    value: {
+      startedAt: state.started,
+      context: { window: 1_000_000, tokens: 0 },
+      rateLimits: state.limits,
+      ...(state.usd === undefined ? {} : { cost: { usd: state.usd } }),
+    },
   }))
+  on('session.turns', () => ({ value: state.turns }))
+  on('session.root', () => ({ value: '/proyecto' }))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+  on('fs.write', (_$, e) => {
+    // El motor entrega la ruta ya resuelta contra el directorio de trabajo: se guarda desde `.claude/`.
+    const path = e.path.replaceAll('\\', '/')
+    writes.push({ path: path.slice(Math.max(0, path.indexOf('.claude/'))), text: e.text })
+
+    return { value: undefined }
+  })
+  // Como el motor: compacta, lanza PostCompact con el resumen y devuelve lo que queda.
+  on('session.compact', async () => {
+    await $.classic.PostCompact({ trigger: 'auto', compact_summary: 'RESUMEN' })
+
+    return { messages: [{ role: 'user' as const, text: 'hola', toolUses: [] }], tokensBefore: 650_000, tokensAfter: 40_000 }
+  })
+  on('classic.PostCompact', () => ({}))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('env.get', () => ({ value: undefined }))
@@ -134,7 +170,11 @@ const world = ($: Engine, on: On, stored: Record<string, unknown> = {}) => {
     spawns,
     steps,
     tools,
+    writes,
     state,
+    // Acaba un turno del hilo principal.
+    turn: () =>
+      $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' }),
     // El modelo anota su lista de tareas entera: [texto, estado] por paso.
     todo: (list: [string, 'pending' | 'in_progress' | 'completed'][], agentId?: string) =>
       $.tool.call({
@@ -589,6 +629,7 @@ test('un solo panel con sus pestañas: el botón de cada una enseña la suya, y 
     ['Agentes', 'primary'],
     ['Tareas', 'secondary'],
     ['Enrutadores', 'secondary'],
+    ['Sesión', 'secondary'],
   ])
   expect(await ui.find({ type: 'Text', text: 'Tarea 1' })).toBeDefined()
   expect(await ui.findAll({ type: 'Select' })).toEqual([])
@@ -599,6 +640,7 @@ test('un solo panel con sus pestañas: el botón de cada una enseña la suya, y 
     ['Agentes', 'secondary'],
     ['Tareas', 'secondary'],
     ['Enrutadores', 'primary'],
+    ['Sesión', 'secondary'],
   ])
   expect(await ui.find({ type: 'Text', text: 'Tarea 1' })).toBeUndefined()
   expect(await ui.find({ key: 'modelo:Explore' })).toBeDefined()
@@ -726,6 +768,7 @@ test('cada estado va con su color: verde lo hecho, amarillo lo que está en curs
     ['Agentes', 'secondary'],
     ['Tareas', 'primary'],
     ['Enrutadores', 'secondary'],
+    ['Sesión', 'secondary'],
   ])
   await ui.unmount()
 })
@@ -802,4 +845,143 @@ test('con la lista de tareas del motor, o sin nadie delante, no se añade la her
   first.state.builtin = []
   await first.start(false)
   expect(first.tools).toEqual([])
+})
+
+// La pestaña Sesión tal como se dibuja, línea a línea.
+const session = async ($: Engine): Promise<string[]> => {
+  await $.command.run({
+    command: 'agentes',
+    args: 'sesion',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 160 },
+  })
+
+  return lines($)
+}
+
+test('la pestaña Sesión resume duración, turnos, tokens del hilo principal y de los agentes, coste y límites', async ($, on) => {
+  const { start, prompt, spawn, ask, state } = world($, on)
+  state.started = NOW - 3_720_000
+  state.turns = 7
+  state.usd = 1.234
+  state.limits = [
+    { kind: 'five_hour', percentUsed: 34.4 },
+    { kind: 'seven_day', percentUsed: 80 },
+  ]
+  await start()
+  await prompt('tarea')
+  await spawn('a1')
+  await ask(usage(1_000, 200, 300, 90_000))
+  await ask(usage(500, 0, 0, 0), 'a1')
+
+  const drawn = await session($)
+  expect(drawn[0]).toBe('Sesión')
+  expect(drawn).toContain(`Empezó       ${fechaLocal(NOW - 3_720_000)} · hace 1h02m`)
+  expect(drawn).toContain('Modelo       opus-5-5')
+  expect(drawn).toContain('Turnos       7')
+  expect(drawn.find(line => line.startsWith('Contexto'))).toMatch(
+    /^Contexto {5}91\.300 · se compacta a los [\d.]+$/,
+  )
+  expect(drawn).toContain('Gastado      2.000')
+  expect(drawn).toContain('  principal  1.500 (75 %)')
+  expect(drawn).toContain('  agentes    500 (25 %)')
+  expect(drawn).toContain('Coste API    1.23 $')
+  expect(drawn).toContain('Límites del plan')
+  expect(drawn).toContain('5 horas      34 % usado')
+  expect(drawn).toContain('Semana       80 % usado')
+  expect(drawn).toContain('Tareas       sin plan')
+  expect(drawn).toContain('Agentes      1 · 1 en curso')
+  expect(drawn).toContain('0 compactaciones')
+  expect(drawn.at(-1)).toBe('Se guarda al acabar el primer turno con tareas o agentes.')
+})
+
+test('sin límites ni coste del plan la pestaña Sesión va sin esas líneas', async ($, on) => {
+  const { start } = world($, on)
+  await start()
+
+  const drawn = await session($)
+  expect(drawn).not.toContain('Límites del plan')
+  expect(drawn.some(line => line.startsWith('Coste'))).toBe(false)
+  expect(drawn.some(line => line.startsWith('Empezó'))).toBe(false)
+  expect(drawn).toContain('Agentes      ninguno')
+})
+
+test('el histórico de la sesión se guarda en el proyecto al acabar cada turno, con el plan y los agentes', async ($, on) => {
+  const { start, prompt, spawn, ask, end, todo, clock, writes, turn } = world($, on)
+  await start()
+  await prompt('revisa la web | y lista errores')
+  // Sin nada que contar no se escribe.
+  await turn()
+  expect(writes).toEqual([])
+
+  await todo([
+    ['Leer la portada', 'in_progress'],
+    ['Entregar la lista', 'pending'],
+  ])
+  await spawn('a1', { name: 'web-seo' })
+  await ask(usage(2_000, 0, 0, 0), 'a1')
+  await clock.advance(65_000)
+  await todo([
+    ['Leer la portada', 'completed'],
+    ['Entregar la lista', 'in_progress'],
+  ])
+  await end('a1')
+
+  const file = `.claude/historial/sesion-${new Date(NOW).toISOString().slice(0, 19).replace(/[T:]/g, '-')}.md`
+  expect(writes.at(-1)?.path).toBe(file)
+  const text = writes.at(-1)?.text ?? ''
+  expect(text).toContain(`# Sesión del ${fechaLocal(NOW)}`)
+  expect(text).toContain('- Proyecto: /proyecto')
+  expect(text).toContain('- Tokens gastados: 2.000 (hilo principal 0, agentes 2.000)')
+  expect(text).toContain('## Plan de tareas (1 de 2 hechas)')
+  expect(text).toContain(`| hecho | Leer la portada | ${hora(NOW)} | ${hora(NOW + 65_000)} | 1m05s |`)
+  expect(text).toContain(`| en curso | Entregar la lista | ${hora(NOW + 65_000)} |  |  |`)
+  expect(text).toContain(`### Tarea 1 · ${hora(NOW)} · 2.000 tok`)
+  // Una barra del prompt no rompe la tabla.
+  expect(text).toContain('> revisa la web | y lista errores')
+  expect(text).toContain(
+    `| ok | ${hora(NOW)} | ${hora(NOW + 65_000)} | 1m05s | 2.000 | web-seo (Explore) | buscar hooks | haiku-5-5 |  |`,
+  )
+  expect((await session($)).at(-1)).toBe(file)
+
+  // El mismo fichero se reescribe; una conversación nueva (/clear) empieza otro y su registro de cero.
+  await clock.advance(10_000)
+  await turn()
+  expect(writes.at(-1)?.path).toBe(file)
+  await $.session.end({ reason: 'clear', sessionId: 's', resume: {} as never })
+  expect(await lines($)).toContain('Agentes      ninguno')
+  await prompt('otra')
+  await spawn('a2')
+  await end('a2')
+  expect(writes.at(-1)?.path).toBe(
+    `.claude/historial/sesion-${new Date(NOW + 75_000).toISOString().slice(0, 19).replace(/[T:]/g, '-')}.md`,
+  )
+  expect(writes.at(-1)?.text).not.toContain('web-seo')
+})
+
+test('en una sesión sin nadie delante no se escribe histórico', async ($, on) => {
+  const { start, prompt, spawn, end, writes } = world($, on)
+  await start(false)
+  await prompt('tarea')
+  await spawn('a1')
+  await end('a1')
+
+  expect(writes).toEqual([])
+})
+
+test('cada compactación queda en la pestaña Sesión y en el histórico con lo que midió y su resumen', async ($, on) => {
+  const { start, writes, settle } = world($, on)
+  await start()
+  await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'hola', toolUses: [] }] })
+  await settle()
+
+  const summary = writes.find(write => write.path.includes('/resumenes/'))?.path ?? ''
+  expect(summary).toMatch(/^\.claude\/resumenes\/resumen-.*\.md$/)
+  const drawn = await session($)
+  expect(drawn).toContain('1 compactación')
+  expect(drawn).toContain(`${hora(NOW).padEnd(13)}650.000 → 40.000`)
+  expect(drawn).toContain(`${''.padEnd(13)}${summary}`)
+  const history = writes.findLast(write => write.path.includes('/historial/'))?.text ?? ''
+  expect(history).toContain('- Compactaciones: 1')
+  expect(history).toContain(`- ${hora(NOW)} · 650.000 → 40.000 tokens · ${summary}`)
 })

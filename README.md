@@ -92,11 +92,11 @@ todas tus sesiones y proyectos.
 
 ## Panel de agentes
 
-Un panel lateral con tres pestañas, que se eligen con los botones de arriba (o con las
-teclas `1`, `2` y `3` cuando el panel tiene el teclado):
+Un panel lateral con cuatro pestañas, que se eligen con los botones de arriba (o con las
+teclas `1` a `4` cuando el panel tiene el teclado):
 
 ```
-[ Agentes ]  [ Tareas ]  [ Enrutadores ]
+[ Agentes ]  [ Tareas ]  [ Enrutadores ]  [ Sesión ]
 ────────────────────────────────────────────────
 Tarea 3 · 12:30:58 · 2 agentes · 21.520 tok
 busca los hooks del mod y revisa los tests
@@ -115,7 +115,7 @@ terminado, `✗` abortado o con error. Los tokens se cuentan igual que `sesión:
 su estado y lo que tardó.
 
 ```
-[ Agentes ]  [ Tareas ]  [ Enrutadores ]
+[ Agentes ]  [ Tareas ]  [ Enrutadores ]  [ Sesión ]
 ────────────────────────────────────────────────
 █████████████░░░░░░░ 2/3 · 16m10s
 ✓ 2 hechas · ● 1 en curso · ○ 0 pendientes
@@ -151,15 +151,60 @@ momento y se guarda para todas tus sesiones y proyectos.
 - Un fork y los agentes de un workflow heredan siempre: Claude Code no deja cambiarlos.
 - El esfuerzo solo se cambia en los modelos que lo admiten.
 
+**Sesión** es el resumen de la sesión en curso:
+
+```
+Sesión
+Empezó       2026-10-10 12:26 · hace 1h48m
+Modelo       opus-5-5
+Turnos       23
+
+Tokens
+Contexto     222.807 · se compacta a los 650.000
+Gastado      2.431.870
+  principal  2.300.000 (95 %)
+  agentes    131.870 (5 %)
+Coste API    18.40 $
+
+Límites del plan
+5 horas      34 % usado · se renueva sáb 10, 17:00
+Semana       80 % usado · se renueva vie 16, 22:00
+
+Trabajo
+Tareas       7 de 9 hechas
+Agentes      4 · 1 en curso
+
+1 compactación
+12:40:11     650.000 → 40.000
+             .claude/resumenes/resumen-2026-10-10-10-40-11.md
+
+Histórico
+.claude/historial/sesion-2026-10-10-10-26-03.md
+```
+
+«Coste API» es lo que dice Claude Code que costarían las respuestas de la sesión a precio de
+API: con un plan de suscripción es una equivalencia, no lo que pagas. Los límites solo
+aparecen en planes de suscripción, tras la primera respuesta.
+
+### Histórico de cada sesión
+
+Al acabar cada turno el mod reescribe `.claude/historial/sesion-<fecha UTC>.md` en el
+proyecto: duración, turnos, tokens y coste, el plan de tareas con la hora y la duración de
+cada paso, los agentes de cada tarea (inicio, fin, duración, tokens, modelo y esfuerzo) y las
+compactaciones con su resumen. Un fichero por conversación: `/clear` empieza otro. Solo en
+sesiones interactivas y solo si hubo tareas, agentes o compactaciones. Si no los quieres en
+tu repositorio, añade `.claude/historial/` a `.gitignore`.
+
 El panel se abre solo con el primer agente de la sesión si el terminal es ancho (desde
-144 columnas). Con `/agentes` se abre a cualquier ancho, `/agentes tareas` y `/agentes rutas` lo abren
-en esa pestaña, `/agentes cerrar` lo cierra y `/agentes limpiar` vacía el registro y el plan. Si lo
+144 columnas). Con `/agentes` se abre a cualquier ancho, `/agentes tareas`, `/agentes rutas` y
+`/agentes sesion` lo abren en esa pestaña, `/agentes cerrar` lo cierra y `/agentes limpiar` vacía el registro y el plan. Si lo
 cierras, no vuelve a abrirse solo hasta que lo pidas. El registro dura lo que la sesión.
 
 ## Qué toca en tu equipo
 
 - **Una variable de entorno del proceso**, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, solo
   mientras dura la sesión. No modifica `settings.json`.
+- **El histórico de cada sesión** en `.claude/historial/` del proyecto.
 - **Ficheros de resumen** en `.claude/resumenes/` del proyecto. Si no los quieres en
   tu repositorio, añade esa carpeta a `.gitignore`.
 - **Una consulta a Claude Code** (`claude -p /usage --safe-mode --no-session-persistence`) al

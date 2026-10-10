@@ -10,7 +10,7 @@ import type {
   TurnStepInput,
 } from 'claude-code'
 
-import type { Agente, Paso, Ruta } from '../types'
+import type { Agente, Compactacion, Paso, Ruta } from '../types'
 
 // Cada tramo se pinta con su color hasta `hasta` tokens de contexto, incluido; por encima del último, ROJO.
 const TRAMOS = [
@@ -292,6 +292,9 @@ const limitar = async ($: EngineInterface, limits: readonly SessionRateLimit[]):
   const found = limits.find(limit => limit.kind === LIMITE_SEMANAL)
   const value = found ? { pct: found.percentUsed, renueva: found.resetsAt ?? null } : null
   await update($, semana, () => value)
+  const corto = limits.find(limit => limit.kind === 'five_hour')
+  const cinco = corto ? { pct: corto.percentUsed, renueva: corto.resetsAt ?? null } : null
+  await update($, cincoHoras, () => cinco)
 }
 
 // El instante de un «Oct 9, 10pm» o un «4:59am» de `/usage`, que vienen en la hora del equipo.
@@ -417,13 +420,14 @@ const leer = async ($: EngineInterface): Promise<void> => {
 // ---------------------------------------------------------------------------------------------
 // Panel de agentes: registro de los agentes de cada tarea y modelo y esfuerzo por tipo de agente.
 // ---------------------------------------------------------------------------------------------
-// Un solo panel con tres pestañas: arriba, un botón por cada una; debajo, la elegida.
+// Un solo panel con cuatro pestañas: arriba, un botón por cada una; debajo, la elegida.
 const PANEL = 'agentes'
 const TITULO = 'Agentes'
 const PESTANAS = [
   { id: 'agentes', titulo: 'Agentes', tecla: '1' },
   { id: 'tareas', titulo: 'Tareas', tecla: '2' },
   { id: 'enrutadores', titulo: 'Enrutadores', tecla: '3' },
+  { id: 'sesion', titulo: 'Sesión', tecla: '4' },
 ] as const
 const COMANDO_AGENTES = 'agentes'
 
@@ -1139,6 +1143,315 @@ const registrarTareas = (on: On): void => {
   })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Pestaña Sesión e histórico: el resumen de la sesión en el panel, y en un fichero que la sobrevive.
+// ---------------------------------------------------------------------------------------------
+// El histórico es un Markdown por sesión en el proyecto, reescrito al acabar cada turno: el plan
+// de tareas, los agentes de cada tarea y las compactaciones. Solo en sesiones interactivas.
+const CARPETA_HISTORICO = '.claude/historial'
+const LIMITE_5H = 'five_hour'
+// Lo que llega del motor y de PostCompact de una misma compactación se junta si llega así de seguido.
+const MISMA_COMPACTACION_MS = 120_000
+const MAX_COMPACTACIONES = 50
+
+// Lo gastado por los agentes de la sesión; el resto de `gastados` es del hilo principal.
+const deAgentes = atom({ plugin: 'tokens-sesion', key: 'deAgentes' } as const, 0)
+const cincoHoras = atom({ plugin: 'tokens-sesion', key: 'cincoHoras' } as const, null)
+const compactaciones = atom({ plugin: 'tokens-sesion', key: 'compactaciones' } as const, [])
+// Cuándo empezó el histórico de esta conversación (da nombre a su fichero) y dónde se guardó.
+const nacida = atom({ plugin: 'tokens-sesion', key: 'nacida' } as const, null)
+const historico = atom({ plugin: 'tokens-sesion', key: 'historico' } as const, null)
+
+const sello = (ms: number): string => new Date(ms).toISOString().slice(0, 19).replace(/[T:]/g, '-')
+
+const fecha = (ms: number): string => {
+  const date = new Date(ms)
+
+  return `${date.getFullYear()}-${dos(date.getMonth() + 1)}-${dos(date.getDate())} ${hora(ms).slice(0, 5)}`
+}
+
+const pct = (parte: number, total: number): string =>
+  total <= 0 ? '0 %' : `${Math.round((parte / total) * 100)} %`
+
+// Una compactación llega en dos avisos (lo que midió el motor y el fichero del resumen), en cualquier orden.
+const anotarCompactacion = async (
+  $: EngineInterface,
+  dato: Partial<Omit<Compactacion, 'hora'>>,
+): Promise<void> => {
+  const now = await $.clock.now()
+  const campos = Object.keys(dato) as (keyof typeof dato)[]
+
+  await update($, compactaciones, list => {
+    const ultima = list.at(-1)
+    const cabe =
+      ultima !== undefined &&
+      now - ultima.hora < MISMA_COMPACTACION_MS &&
+      campos.every(campo => ultima[campo] === null)
+
+    return cabe
+      ? [...list.slice(0, -1), { ...ultima, ...dato }]
+      : [...list, { hora: now, antes: null, despues: null, fichero: null, ...dato }].slice(-MAX_COMPACTACIONES)
+  })
+}
+
+// El histórico entero, en Markdown.
+const textoHistorico = (datos: {
+  inicio: number
+  now: number
+  proyecto: string
+  modelo: string
+  turnos: number | null
+  total: number
+  agentesTok: number
+  usd: number | null
+  pasos: readonly Paso[]
+  agentes: readonly Agente[]
+  tareas: readonly { n: number; inicio: number; texto: string }[]
+  compactaciones: readonly Compactacion[]
+}): string => {
+  const celda = (text: string): string => text.replace(/\|/g, '\\|').replace(/\s+/g, ' ')
+  const lines = [
+    `# Sesión del ${fecha(datos.inicio)}`,
+    '',
+    `- Proyecto: ${datos.proyecto}`,
+    `- Modelo: ${datos.modelo}`,
+    `- Duración: ${duracion(datos.now - datos.inicio)} (hasta las ${hora(datos.now)})`,
+    ...(datos.turnos === null ? [] : [`- Turnos: ${datos.turnos}`]),
+    `- Tokens gastados: ${conPuntos(datos.total)} (hilo principal ${conPuntos(Math.max(0, datos.total - datos.agentesTok))}, agentes ${conPuntos(datos.agentesTok)})`,
+    ...(datos.usd === null ? [] : [`- Coste a precio de API: ${datos.usd.toFixed(2)} $`]),
+    `- Compactaciones: ${datos.compactaciones.length}`,
+  ]
+
+  if (datos.pasos.length > 0) {
+    const hechos = datos.pasos.filter(paso => paso.estado === 'hecho').length
+    lines.push(
+      '',
+      `## Plan de tareas (${hechos} de ${datos.pasos.length} hechas)`,
+      '',
+      '| Estado | Paso | Inicio | Fin | Duración |',
+      '|---|---|---|---|---|',
+      ...datos.pasos.map(
+        paso =>
+          `| ${paso.estado} | ${celda(paso.texto)} | ${paso.inicio === null ? '' : hora(paso.inicio)} | ${paso.fin === null ? '' : hora(paso.fin)} | ${paso.ms > 0 ? duracion(paso.ms) : ''} |`,
+      ),
+    )
+  }
+
+  if (datos.agentes.length > 0) {
+    lines.push('', '## Agentes')
+
+    for (const n of [...new Set(datos.agentes.map(agente => agente.tarea))].sort((a, b) => a - b)) {
+      const suyos = datos.agentes.filter(agente => agente.tarea === n)
+      const cabecera = datos.tareas.find(tarea => tarea.n === n)
+      const total = suyos.reduce((sum, agente) => sum + agente.tokens, 0)
+      lines.push(
+        '',
+        cabecera
+          ? `### Tarea ${n} · ${hora(cabecera.inicio)} · ${conPuntos(total)} tok`
+          : `### Antes de la primera tarea · ${conPuntos(total)} tok`,
+        ...(cabecera && cabecera.texto !== '' ? ['', `> ${cabecera.texto}`] : []),
+        '',
+        '| Estado | Inicio | Fin | Duración | Tokens | Agente | Encargo | Modelo | Esfuerzo |',
+        '|---|---|---|---|---|---|---|---|---|',
+        ...suyos.map(
+          agente =>
+            `| ${agente.estado} | ${hora(agente.inicio)} | ${agente.fin === null ? '' : hora(agente.fin)} | ${agente.fin === null ? '' : duracion(agente.fin - agente.inicio)} | ${conPuntos(agente.tokens)} | ${celda(agente.nombre === null ? agente.tipo : `${agente.nombre} (${agente.tipo})`)} | ${celda(agente.descripcion)} | ${agente.modelo.replace(/^claude-/, '')} | ${agente.esfuerzo ?? ''} |`,
+        ),
+      )
+    }
+  }
+
+  if (datos.compactaciones.length > 0) {
+    lines.push(
+      '',
+      '## Compactaciones',
+      '',
+      ...datos.compactaciones.map(
+        one =>
+          `- ${hora(one.hora)}` +
+          (one.antes === null || one.despues === null
+            ? ''
+            : ` · ${conPuntos(one.antes)} → ${conPuntos(one.despues)} tokens`) +
+          (one.fichero === null ? '' : ` · ${one.fichero}`),
+      ),
+    )
+  }
+
+  return `${lines.join('\n')}\n`
+}
+
+// Reescribe el histórico de la sesión si hay algo que contar.
+const historiar = async ($: EngineInterface): Promise<void> => {
+  if (!interactiva) {
+    return
+  }
+
+  const lista = await read($, agentes)
+  const plan = await read($, pasos)
+  const hechas = await read($, compactaciones)
+
+  if (lista.length === 0 && plan.length === 0 && hechas.length === 0) {
+    return
+  }
+
+  const now = await $.clock.now()
+  const inicio = (await read($, nacida)) ?? now
+  await update($, nacida, () => inicio)
+  const usage = await $.session.usage()
+  const file = `${CARPETA_HISTORICO}/sesion-${sello(inicio)}.md`
+  await $.fs.write(
+    file,
+    textoHistorico({
+      inicio,
+      now,
+      proyecto: await $.session.root(),
+      modelo: await $.session.model(),
+      turnos: await $.session.turns().catch(() => null),
+      total: await read($, gastados),
+      agentesTok: await read($, deAgentes),
+      usd: usage.cost?.usd ?? null,
+      pasos: plan,
+      agentes: lista,
+      tareas: await read($, tareas),
+      compactaciones: hechas,
+    }),
+  )
+  await update($, historico, () => file)
+}
+
+// Una conversación nueva (/clear, o al retomar otra) empieza su registro y su histórico de cero.
+const reiniciarSesion = async ($: EngineInterface): Promise<void> => {
+  await update($, agentes, () => [])
+  await update($, tareas, () => [])
+  await update($, pasos, () => [])
+  await update($, deAgentes, () => 0)
+  await update($, compactaciones, () => [])
+  const now = await $.clock.now()
+  await update($, nacida, () => now)
+  await update($, historico, () => null)
+  sueltos.clear()
+}
+
+const dibujarSesion = async (
+  $: EngineInterface,
+  e: RenderInput<'Pane'>,
+): Promise<RenderElement> => {
+  const { Box, Text } = $.ui.resolve(e)
+  const now = await $.clock.now()
+  const usage = await $.session.usage()
+  const turnos = await $.session.turns().catch(() => null)
+  const total = await read($, gastados)
+  const agentesTok = Math.min(total, await read($, deAgentes))
+  const tokens = (await read($, contexto)) ?? usage.context.tokens ?? 0
+  const rige = await read($, efectivo)
+  const limite5 = await read($, cincoHoras)
+  const limite7 = await read($, semana)
+  const hechas = await read($, compactaciones)
+  const file = await read($, historico)
+  const plan = await read($, pasos)
+  const lista = await read($, agentes)
+  const filas: RenderElement[] = []
+  const dato = (etiqueta: string, valor: string, color?: string) =>
+    filas.push(
+      <Box flexDirection="row">
+        <Text dimColor>{etiqueta.padEnd(13)}</Text>
+        <Box flexGrow={1} flexShrink={1}>
+          <Text color={color} wrap="wrap">
+            {valor}
+          </Text>
+        </Box>
+      </Box>,
+    )
+  const titulo = (text: string) => filas.push(<Text> </Text>, <Text bold>{text}</Text>)
+  const limite = (etiqueta: string, value: { pct: number; renueva: string | null } | null) => {
+    if (value === null) {
+      return
+    }
+
+    const renueva = value.renueva === null ? null : cuando(value.renueva)
+    dato(
+      etiqueta,
+      `${Math.round(value.pct)} % usado${renueva === null ? '' : ` · se renueva ${renueva}`}`,
+      colorUso(value.pct),
+    )
+  }
+
+  filas.push(<Text bold>Sesión</Text>)
+
+  if (usage.startedAt > 0) {
+    dato('Empezó', `${fecha(usage.startedAt)} · hace ${duracion(now - usage.startedAt)}`)
+  }
+
+  dato('Modelo', (await $.session.model()).replace(/^claude-/, ''))
+
+  if (turnos !== null) {
+    dato('Turnos', String(turnos))
+  }
+
+  titulo('Tokens')
+  dato(
+    'Contexto',
+    `${conPuntos(tokens)}${rige === 0 ? '' : ` · se compacta a los ${conPuntos(rige)}`}`,
+    colorDe(tokens),
+  )
+  dato('Gastado', conPuntos(total))
+  dato('  principal', `${conPuntos(total - agentesTok)} (${pct(total - agentesTok, total)})`)
+  dato('  agentes', `${conPuntos(agentesTok)} (${pct(agentesTok, total)})`)
+
+  if (usage.cost !== undefined) {
+    // Lo que costarían esas respuestas a precio de API; con un plan de suscripción es una equivalencia.
+    dato('Coste API', `${usage.cost.usd.toFixed(2)} $`)
+  }
+
+  if (limite5 !== null || limite7 !== null) {
+    titulo('Límites del plan')
+    limite('5 horas', limite5)
+    limite('Semana', limite7)
+  }
+
+  titulo('Trabajo')
+  dato(
+    'Tareas',
+    plan.length === 0
+      ? 'sin plan'
+      : `${plan.filter(paso => paso.estado === 'hecho').length} de ${plan.length} hechas`,
+  )
+  dato(
+    'Agentes',
+    lista.length === 0
+      ? 'ninguno'
+      : `${lista.length} · ${lista.filter(agente => agente.estado === 'en curso').length} en curso`,
+  )
+
+  titulo(hechas.length === 1 ? '1 compactación' : `${hechas.length} compactaciones`)
+
+  for (const one of hechas) {
+    dato(
+      hora(one.hora),
+      one.antes === null || one.despues === null
+        ? 'contexto compactado'
+        : `${conPuntos(one.antes)} → ${conPuntos(one.despues)}`,
+    )
+
+    if (one.fichero !== null) {
+      dato('', one.fichero)
+    }
+  }
+
+  titulo('Histórico')
+  filas.push(
+    <Text dimColor={file === null} wrap="wrap">
+      {file ?? 'Se guarda al acabar el primer turno con tareas o agentes.'}
+    </Text>,
+  )
+
+  return (
+    <Box key="cuerpo" flexDirection="column">
+      {filas}
+    </Box>
+  )
+}
+
 // Un plugin engancha cada evento una sola vez: el arranque de la sesión y las peticiones al modelo
 // son también de la banda, y sus hooks llaman a estas tres funciones.
 
@@ -1147,10 +1460,13 @@ const arrancarAgentes = async ($: EngineInterface, isInteractive: boolean): Prom
   await $.command.register({
     name: COMANDO_AGENTES,
     description: 'Panel con los agentes de cada tarea: inicio, fin, duración y tokens',
-    argumentHint: '[tareas | rutas | cerrar | limpiar]',
+    argumentHint: '[tareas | rutas | sesion | cerrar | limpiar]',
   })
   const stored = validas(await $.store.get(CLAVE))
   await update($, rutas, () => stored)
+  // Al recargar el mod la conversación sigue: su histórico conserva el nombre.
+  const now = await $.clock.now()
+  await update($, nacida, born => born ?? now)
 
   // El plan solo interesa donde hay alguien mirando el panel.
   if (isInteractive) {
@@ -1223,9 +1539,9 @@ const registrarAgentes = (on: On): void => {
       return { text: 'Registro de agentes y plan de tareas vaciados.' }
     }
 
-    if (typed !== '' && typed !== 'rutas' && typed !== 'tareas') {
+    if (typed !== '' && typed !== 'rutas' && typed !== 'tareas' && typed !== 'sesion') {
       return {
-        text: 'Uso: /agentes (abre el panel), /agentes tareas y /agentes rutas (lo abren en esa pestaña), /agentes cerrar, /agentes limpiar.',
+        text: 'Uso: /agentes (abre el panel), /agentes tareas, /agentes rutas y /agentes sesion (lo abren en esa pestaña), /agentes cerrar, /agentes limpiar.',
       }
     }
 
@@ -1236,6 +1552,10 @@ const registrarAgentes = (on: On): void => {
 
     if (typed === 'tareas') {
       await update($, pestana, () => 'tareas')
+    }
+
+    if (typed === 'sesion') {
+      await update($, pestana, () => 'sesion')
     }
 
     const opened = await abrir($)
@@ -1326,7 +1646,10 @@ const registrarAgentes = (on: On): void => {
       await cambiar($, id, agente => ({ ...agente, fin, estado }))
     }
 
-    return next(e)
+    const done = await next(e)
+    await historiar($).catch(() => undefined)
+
+    return done
   })
 
   on('ui.close', { id: PANEL }, async ($, e, next) => {
@@ -1345,11 +1668,13 @@ const registrarAgentes = (on: On): void => {
         ? await dibujarRutas($, e)
         : actual === 'tareas'
           ? await dibujarTareas($, e)
-          : await dibujarAgentes($, e)
+          : actual === 'sesion'
+            ? await dibujarSesion($, e)
+            : await dibujarAgentes($, e)
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
           {PESTANAS.map(({ id, titulo, tecla }) => (
             <Button
               key={`pestana:${id}`}
@@ -1452,6 +1777,10 @@ export const register: Register = on => {
       const spent = gasto(usage)
       await update($, gastados, total => total + spent)
 
+      if (e.agentId !== undefined) {
+        await update($, deAgentes, total => total + spent)
+      }
+
       if (e.agentId === undefined) {
         const tokens = enviado(usage)
         await update($, contexto, () => tokens)
@@ -1488,6 +1817,8 @@ export const register: Register = on => {
     if (e.agentId === undefined && e.trigger !== 'precompute' && done.skip === undefined) {
       const after = done.tokensAfter
       await update($, contexto, () => after ?? null)
+      await anotarCompactacion($, { antes: done.tokensBefore ?? null, despues: after ?? null })
+      historiar($).catch(() => undefined)
     }
 
     return done
@@ -1498,6 +1829,8 @@ export const register: Register = on => {
       // Hasta la siguiente respuesta, el contexto es el que diga el motor.
       await update($, contexto, () => null)
       const file = await guardar($, e.compact_summary)
+      await anotarCompactacion($, { fichero: file })
+      historiar($).catch(() => undefined)
       $.ui.toast(`Resumen de la sesión guardado en ${file}`)
     }
 
@@ -1509,6 +1842,7 @@ export const register: Register = on => {
       await update($, gastados, () => 0)
       await update($, contexto, () => null)
       await update($, resumen, () => null)
+      await reiniciarSesion($)
     }
 
     return next(e)

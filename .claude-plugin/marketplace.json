@@ -8,7 +8,7 @@
     {
       "name": "tokens-sesion",
       "source": "./",
-      "description": "Banda sobre el prompt con el contexto (cifra y barra de verde a rojo), el gasto de la sesión, el uso de CPU y RAM y el límite semanal del plan; el motor compacta al llegar al umbral que marques, también a mitad de una tarea, y se guarda el resumen. Panel lateral con los subagentes de cada tarea, el plan paso a paso con sus tiempos y el modelo y esfuerzo de cada tipo de agente."
+      "description": "Banda sobre el prompt con el contexto (cifra y barra de verde a rojo), el gasto de la sesión, el uso de CPU y RAM y el límite semanal del plan; el motor compacta al llegar al umbral que marques, también a mitad de una tarea, y se guarda el resumen. Panel lateral con los subagentes de cada tarea, el plan paso a paso con sus tiempos, el modelo y esfuerzo de cada tipo de agente y el resumen de la sesión, con histórico guardado."
     }
   ]
 }
