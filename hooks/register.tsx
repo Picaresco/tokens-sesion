@@ -1,5 +1,16 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register, SessionRateLimit } from 'claude-code'
+import type {
+  EngineInterface,
+  ModelUsage,
+  On,
+  Register,
+  RenderElement,
+  RenderInput,
+  SessionRateLimit,
+  TurnStepInput,
+} from 'claude-code'
+
+import type { Agente, Ruta } from '../types'
 
 // Cada tramo se pinta con su color hasta `hasta` tokens de contexto, incluido; por encima del último, ROJO.
 const TRAMOS = [
@@ -403,7 +414,612 @@ const leer = async ($: EngineInterface): Promise<void> => {
   await update($, uso, () => null)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Panel de agentes: registro de los agentes de cada tarea y modelo y esfuerzo por tipo de agente.
+// ---------------------------------------------------------------------------------------------
+// Un solo panel con dos pestañas: arriba, un botón por cada una; debajo, la elegida.
+const PANEL = 'agentes'
+const TITULO = 'Agentes'
+const PESTANAS = [
+  { id: 'agentes', titulo: 'Agentes', tecla: '1' },
+  { id: 'enrutadores', titulo: 'Enrutadores', tecla: '2' },
+] as const
+const COMANDO_AGENTES = 'agentes'
+
+// Lo que se puede elegir para cada tipo de agente. El modelo es un alias: el motor lo resuelve a
+// su versión actual al arrancar el agente. HEREDAR deja lo que el motor decida.
+const HEREDAR = 'heredar'
+const MODELOS = [HEREDAR, 'haiku', 'sonnet', 'opus', 'fable'] as const
+const ESFUERZOS = [HEREDAR, 'low', 'medium', 'high', 'xhigh', 'max'] as const
+type Esfuerzo = Exclude<(typeof ESFUERZOS)[number], typeof HEREDAR>
+const SIN_RUTA: Ruta = { modelo: HEREDAR, esfuerzo: HEREDAR }
+// La fila de los tipos que no tienen la suya.
+const RESTO = '*'
+// Los tipos del motor, que tienen fila aunque aún no se hayan ofrecido al modelo.
+const TIPOS = ['Explore', 'Plan', 'general-purpose', 'claude', 'claude-code-guide'] as const
+// Un fork hereda siempre el modelo y el esfuerzo de quien lo lanza.
+const FORK = 'fork'
+const RECOMENDADAS: Record<string, Ruta> = {
+  Explore: { modelo: 'haiku', esfuerzo: 'low' },
+  Plan: { modelo: 'opus', esfuerzo: 'high' },
+  'general-purpose': { modelo: 'sonnet', esfuerzo: 'medium' },
+  'claude-code-guide': { modelo: 'haiku', esfuerzo: 'low' },
+}
+// La tabla se guarda en el almacén del mod, común a todas las sesiones y proyectos del usuario.
+const CLAVE = 'rutas'
+// Columnas del nombre del tipo, y desde cuántas el nombre y sus selectores van en una fila.
+const ANCHO_TIPO = 18
+const ANCHO_RUTA = 44
+
+// El registro guarda los últimos MAX_AGENTES agentes y las tareas que los lanzaron.
+const MAX_AGENTES = 200
+// De cada tarea se enseña el principio de su prompt.
+const TEXTO_TAREA = 120
+
+// Columnas de cada parte de la línea de un agente: «✓ 12:31:05 → 12:32:47» y «  1m42s    18.420 tok».
+// Con ANCHO_LINEA todo va en una línea; con ANCHO_CIFRAS, horas y cifras juntas y el agente debajo;
+// con menos, cada parte en su fila.
+const ANCHO_CIFRAS = 44
+const ANCHO_LINEA = 76
+// Lo que el panel pide de ancho al acoplarse.
+const COLUMNAS = 48
+
+const MARCAS = {
+  'en curso': { signo: '●', color: 'warning' },
+  ok: { signo: '✓', color: 'success' },
+  abortado: { signo: '✗', color: 'error' },
+  error: { signo: '✗', color: 'error' },
+} as const
+
+const agentes = atom({ plugin: 'tokens-sesion', key: 'agentes' } as const, [])
+const tareas = atom({ plugin: 'tokens-sesion', key: 'tareas' } as const, [])
+// La persona cerró el panel: no vuelve a abrirse solo hasta que lo pida con el comando.
+const oculto = atom({ plugin: 'tokens-sesion', key: 'oculto' } as const, false)
+const rutas = atom({ plugin: 'tokens-sesion', key: 'rutas' } as const, {})
+// Los tipos de agente que el motor ha ofrecido al modelo o ha arrancado en la sesión.
+const tipos = atom({ plugin: 'tokens-sesion', key: 'tipos' } as const, [])
+const pestana = atom({ plugin: 'tokens-sesion', key: 'pestana' } as const, 'agentes')
+
+// Tokens de un agente cuya primera petición llega antes de que su arranque quede anotado.
+const sueltos = new Map<string, number>()
+const MAX_SUELTOS = 50
+
+const dos = (n: number): string => String(n).padStart(2, '0')
+
+// La hora del equipo: el módulo ve la zona horaria del sistema.
+const hora = (ms: number): string => {
+  const date = new Date(ms)
+
+  return `${dos(date.getHours())}:${dos(date.getMinutes())}:${dos(date.getSeconds())}`
+}
+
+const duracion = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000))
+
+  if (s < 60) {
+    return `${s}s`
+  }
+
+  if (s < 3600) {
+    return `${Math.floor(s / 60)}m${dos(s % 60)}s`
+  }
+
+  return `${Math.floor(s / 3600)}h${dos(Math.floor((s % 3600) / 60))}m`
+}
+
+const resumir = (text: string): string => {
+  const line = text.replace(/\s+/g, ' ').trim()
+
+  return line.length > TEXTO_TAREA ? `${line.slice(0, TEXTO_TAREA - 1)}…` : line
+}
+
+// Cambia el agente `id` si está en el registro; dice si estaba.
+const cambiar = async (
+  $: EngineInterface,
+  id: string,
+  change: (agente: Agente) => Agente,
+): Promise<boolean> => {
+  if (!(await read($, agentes)).some(agente => agente.id === id)) {
+    return false
+  }
+
+  await update($, agentes, list => list.map(agente => (agente.id === id ? change(agente) : agente)))
+
+  return true
+}
+
+const abrir = ($: EngineInterface) => $.ui.open({ id: PANEL, title: TITULO, columns: COLUMNAS })
+
+const esModelo = (value: unknown): value is string =>
+  typeof value === 'string' && (MODELOS as readonly string[]).includes(value)
+
+const esEsfuerzo = (value: unknown): value is string =>
+  typeof value === 'string' && (ESFUERZOS as readonly string[]).includes(value)
+
+// Lo guardado puede venir de otra versión del mod: solo vale lo que se puede elegir hoy.
+const validas = (stored: unknown): Record<string, Ruta> => {
+  const table: Record<string, Ruta> = {}
+
+  if (typeof stored !== 'object' || stored === null) {
+    return table
+  }
+
+  for (const [tipo, ruta] of Object.entries(stored)) {
+    const { modelo, esfuerzo } = (ruta ?? {}) as Partial<Ruta>
+
+    if (esModelo(modelo) && esEsfuerzo(esfuerzo) && (modelo !== HEREDAR || esfuerzo !== HEREDAR)) {
+      table[tipo] = { modelo, esfuerzo }
+    }
+  }
+
+  return table
+}
+
+const rutaDe = (table: Record<string, Ruta>, tipo: string): Ruta =>
+  table[tipo] ?? table[RESTO] ?? SIN_RUTA
+
+const guardarRutas = async (
+  $: EngineInterface,
+  change: (table: Record<string, Ruta>) => Record<string, Ruta>,
+) => {
+  await update($, rutas, table => validas(change(table)))
+  await $.store.set(CLAVE, await read($, rutas))
+}
+
+// El esfuerzo que la tabla da al agente `id`. Su primera petición puede salir antes de que su
+// arranque quede anotado: entonces el tipo se le pregunta al motor, que no lista los de un workflow.
+const esfuerzoDe = async ($: EngineInterface, id: string): Promise<string> => {
+  const agente = (await read($, agentes)).find(one => one.id === id)
+
+  if (agente?.hereda) {
+    return HEREDAR
+  }
+
+  const tipo = agente?.tipo ?? (await $.agent.list()).find(one => one.id === id)?.type
+
+  return tipo === undefined || tipo === FORK ? HEREDAR : rutaDe(await read($, rutas), tipo).esfuerzo
+}
+
+// Apunta un tipo de agente para que tenga fila en la tabla.
+const apuntar = async ($: EngineInterface, tipo: string) => {
+  if (tipo === FORK || (await read($, tipos)).includes(tipo)) {
+    return
+  }
+
+  await update($, tipos, list => (list.includes(tipo) ? list : [...list, tipo]))
+}
+
+const dibujarAgentes = async (
+  $: EngineInterface,
+  e: RenderInput<'Pane'>,
+): Promise<RenderElement> => {
+  const { Box, Text } = $.ui.resolve(e)
+  const list = await read($, agentes)
+  const cabeceras = await read($, tareas)
+  const ancho = e.props.bodyColumns
+
+  if (list.length === 0) {
+    return (
+      <Box key="cuerpo" flexDirection="column">
+        <Text dimColor>Sin agentes todavía.</Text>
+      </Box>
+    )
+  }
+
+  const filas: RenderElement[] = []
+  // La tarea más reciente arriba; dentro de cada una, los agentes por orden de arranque.
+  const numeros = [...new Set(list.map(agente => agente.tarea))].sort((a, b) => b - a)
+
+  for (const n of numeros) {
+    const suyos = list.filter(agente => agente.tarea === n)
+    const cabecera = cabeceras.find(tarea => tarea.n === n)
+    const total = suyos.reduce((sum, agente) => sum + agente.tokens, 0)
+    const cuantos = suyos.length === 1 ? '1 agente' : `${suyos.length} agentes`
+
+    if (filas.length > 0) {
+      filas.push(<Text> </Text>)
+    }
+
+    filas.push(
+      <Text bold wrap="truncate-end">
+        {cabecera ? `Tarea ${n} · ${hora(cabecera.inicio)}` : 'Antes de la primera tarea'}
+        {` · ${cuantos} · ${conPuntos(total)} tok`}
+      </Text>,
+    )
+
+    if (cabecera && cabecera.texto !== '') {
+      filas.push(
+        <Text dimColor italic wrap="truncate-end">
+          {cabecera.texto}
+        </Text>,
+      )
+    }
+
+    for (const agente of suyos) {
+      const marca = MARCAS[agente.estado]
+      const horas = ` ${hora(agente.inicio)} → ${agente.fin === null ? 'en curso' : hora(agente.fin)}`
+      const tiempo = agente.fin === null ? '' : duracion(agente.fin - agente.inicio)
+      const cifras = `${tiempo.padStart(7)} ${conPuntos(agente.tokens).padStart(9)} tok`
+      const quien = [
+        agente.nombre === null ? agente.tipo : `${agente.nombre} (${agente.tipo})`,
+        agente.descripcion,
+        agente.modelo.replace(/^claude-/, ''),
+        agente.esfuerzo ?? '',
+      ]
+        .filter(part => part !== '')
+        .join(' · ')
+      const cabeza = (
+        <Text>
+          <Text color={marca.color}>{marca.signo}</Text>
+          {horas}
+        </Text>
+      )
+
+      if (ancho >= ANCHO_LINEA) {
+        filas.push(
+          <Text wrap="truncate-end">
+            {cabeza}
+            {`  ${cifras}  `}
+            <Text dimColor>{quien}</Text>
+          </Text>,
+        )
+        continue
+      }
+
+      if (ancho >= ANCHO_CIFRAS) {
+        filas.push(
+          <Text>
+            {cabeza}
+            {`  ${cifras}`}
+          </Text>,
+        )
+      } else {
+        filas.push(cabeza, <Text>{`  ${cifras.trimStart()}`}</Text>)
+      }
+
+      filas.push(
+        <Text dimColor wrap="truncate-end">
+          {`  ${quien}`}
+        </Text>,
+      )
+    }
+  }
+
+  return <Box key="cuerpo" flexDirection="column">{filas}</Box>
+}
+
+const dibujarRutas = async (
+  $: EngineInterface,
+  e: RenderInput<'Pane'>,
+): Promise<RenderElement> => {
+  const table = await read($, rutas)
+  const vistos = await read($, tipos)
+  const list = await read($, agentes)
+  const ancho = e.props.bodyColumns
+  const nombres = [
+    ...new Set([...TIPOS, ...vistos, ...Object.keys(table).filter(tipo => tipo !== RESTO)]),
+    RESTO,
+  ]
+  // Lo gastado por los agentes de la sesión, por el modelo con el que corrieron.
+  const gastos = new Map<string, number>()
+
+  for (const agente of list) {
+    const modelo = agente.modelo.replace(/^claude-/, '')
+    gastos.set(modelo, (gastos.get(modelo) ?? 0) + agente.tokens)
+  }
+
+  const pie =
+    gastos.size === 0
+      ? 'Sin agentes todavía.'
+      : [...gastos].map(([modelo, tokens]) => `${modelo} ${conPuntos(tokens)}`).join(' · ')
+
+  // Donde no hay selectores la tabla se lee, y se cambia desde un terminal o el escritorio.
+  if (e.surface === 'mobile') {
+    const { Box, Text } = $.ui.resolve(e)
+
+    return (
+      <Box key="cuerpo" flexDirection="column">
+        <Text bold>Modelo y esfuerzo por tipo de agente</Text>
+        {nombres.map(tipo => (
+          <Text>
+            {`${tipo === RESTO ? 'Los demás' : tipo}: ${rutaDe(table, tipo).modelo} · ${rutaDe(table, tipo).esfuerzo}`}
+          </Text>
+        ))}
+        <Text dimColor>{`Tokens por modelo: ${pie}`}</Text>
+      </Box>
+    )
+  }
+
+  const { Box, Text, Select, Button } = $.ui.resolve(e)
+  const enFila = ancho >= ANCHO_RUTA
+  const filas: RenderElement[] = []
+
+  for (const tipo of nombres) {
+    // Cada fila enseña lo que tiene puesto, no lo que le llega de la de los demás.
+    const ruta = table[tipo] ?? SIN_RUTA
+    const nombre = tipo === RESTO ? 'Los demás' : tipo
+    const corto =
+      nombre.length > ANCHO_TIPO ? `${nombre.slice(0, ANCHO_TIPO - 1)}…` : nombre.padEnd(ANCHO_TIPO)
+    const elegir = (campo: keyof Ruta) => (value: string) => {
+      void guardarRutas($, now => ({ ...now, [tipo]: { ...(now[tipo] ?? SIN_RUTA), [campo]: value } }))
+    }
+
+    filas.push(
+      <Box flexDirection={enFila ? 'row' : 'column'}>
+        <Text bold={tipo === RESTO} wrap="truncate-end">
+          {enFila ? `${corto} ` : nombre}
+        </Text>
+        <Box flexDirection="row" marginLeft={enFila ? 0 : 2}>
+          <Select
+            key={`modelo:${tipo}`}
+            options={MODELOS.map(value => ({ value }))}
+            value={ruta.modelo}
+            onSelect={elegir('modelo')}
+          />
+          <Text> </Text>
+          <Select
+            key={`esfuerzo:${tipo}`}
+            options={ESFUERZOS.map(value => ({ value }))}
+            value={ruta.esfuerzo}
+            onSelect={elegir('esfuerzo')}
+          />
+        </Box>
+      </Box>,
+    )
+  }
+
+  return (
+    <Box key="cuerpo" flexDirection="column">
+      <Text bold>Modelo y esfuerzo por tipo de agente</Text>
+      {enFila && <Text dimColor>{`${'Tipo'.padEnd(ANCHO_TIPO)} Modelo y esfuerzo`}</Text>}
+      {filas}
+      <Text> </Text>
+      <Text dimColor wrap="wrap">
+        Un fork y los agentes de un workflow heredan siempre.
+      </Text>
+      <Box flexDirection="row" marginTop={1}>
+        <Button
+          key="recomendadas"
+          label="Recomendados"
+          onPress={() => {
+            void guardarRutas($, () => RECOMENDADAS)
+          }}
+        />
+        <Text> </Text>
+        <Button
+          key="heredar"
+          label="Todo heredar"
+          onPress={() => {
+            void guardarRutas($, () => ({}))
+          }}
+        />
+      </Box>
+      <Text> </Text>
+      <Text dimColor>Tokens por modelo en la sesión</Text>
+      <Text wrap="wrap">{pie}</Text>
+    </Box>
+  )
+}
+
+// Un plugin engancha cada evento una sola vez: el arranque de la sesión y las peticiones al modelo
+// son también de la banda, y sus hooks llaman a estas tres funciones.
+
+// Al arrancar la sesión (o recargar el mod): el comando y la tabla guardada.
+const arrancarAgentes = async ($: EngineInterface): Promise<void> => {
+  await $.command.register({
+    name: COMANDO_AGENTES,
+    description: 'Panel con los agentes de cada tarea: inicio, fin, duración y tokens',
+    argumentHint: '[rutas | cerrar | limpiar]',
+  })
+  const stored = validas(await $.store.get(CLAVE))
+  await update($, rutas, () => stored)
+}
+
+// La petición tal como debe salir: con el esfuerzo de la tabla si es de un agente y el modelo lo admite.
+const enrutarPaso = async ($: EngineInterface, e: TurnStepInput): Promise<TurnStepInput> => {
+  const id = e.agentId
+
+  if (id === undefined || e.effort === undefined) {
+    return e
+  }
+
+  const esfuerzo = await esfuerzoDe($, id)
+
+  return esfuerzo === HEREDAR ? e : { ...e, effort: esfuerzo as Esfuerzo }
+}
+
+// Cada petición de un agente suma a su línea; si ya había acabado (lo retomaron), vuelve a estar en curso.
+const contarPaso = async (
+  $: EngineInterface,
+  sent: TurnStepInput,
+  usage: ModelUsage | null | undefined,
+): Promise<void> => {
+  const id = sent.agentId
+
+  if (id === undefined || !usage) {
+    return
+  }
+
+  const spent = gasto(usage)
+  const known = await cambiar($, id, agente => ({
+    ...agente,
+    tokens: agente.tokens + spent,
+    fin: null,
+    estado: 'en curso',
+    esfuerzo: sent.effort === undefined ? null : String(sent.effort),
+  }))
+
+  if (!known) {
+    // Los ids que nunca arrancan como agente (compactación, memoria) no se acumulan.
+    if (sueltos.size >= MAX_SUELTOS) {
+      sueltos.clear()
+    }
+
+    sueltos.set(id, (sueltos.get(id) ?? 0) + spent)
+  }
+}
+
+// Los hooks que son solo del panel de agentes.
+const registrarAgentes = (on: On): void => {
+  on('command.run', { command: COMANDO_AGENTES }, async ($, e) => {
+    const typed = e.args.trim().toLowerCase()
+
+    if (typed === 'cerrar') {
+      await update($, oculto, () => true)
+      await $.ui.close({ id: PANEL })
+
+      return { text: 'Panel de agentes cerrado. El registro sigue: /agentes lo vuelve a abrir.' }
+    }
+
+    if (typed === 'limpiar') {
+      await update($, agentes, () => [])
+      await update($, tareas, () => [])
+      sueltos.clear()
+
+      return { text: 'Registro de agentes vaciado.' }
+    }
+
+    if (typed !== '' && typed !== 'rutas') {
+      return {
+        text: 'Uso: /agentes (abre el panel), /agentes rutas (lo abre en la pestaña Enrutadores), /agentes cerrar, /agentes limpiar.',
+      }
+    }
+
+    await update($, oculto, () => false)
+    if (typed === 'rutas') {
+      await update($, pestana, () => 'enrutadores')
+    }
+
+    const opened = await abrir($)
+
+    return {
+      text: opened.isPlaced
+        ? 'Panel de agentes abierto.'
+        : 'El panel de agentes no cabe ahora: se abrirá al ensanchar el terminal.',
+    }
+  })
+
+  // Cada prompt del hilo principal es una tarea; se guardan solo las que lanzaron algún agente.
+  on('turn.start', async ($, e, next) => {
+    const inicio = await $.clock.now()
+    const usadas = new Set((await read($, agentes)).map(agente => agente.tarea))
+    await update($, tareas, list => [
+      ...list.filter(tarea => usadas.has(tarea.n)),
+      { n: (list.at(-1)?.n ?? 0) + 1, inicio, texto: resumir(e.text) },
+    ])
+
+    return next(e)
+  })
+
+  // Cada tipo que el motor ofrece al modelo tiene su fila en la tabla.
+  on('agent.offer', async ($, e, next) => {
+    await apuntar($, e.agent)
+
+    return next(e)
+  })
+
+  // El modelo de la tabla manda sobre el que pida la llamada; a un fork y a los agentes de un
+  // workflow el motor no deja cambiárselo.
+  on('agent.spawn', async ($, e, next) => {
+    const inicio = await $.clock.now()
+    const modelo = rutaDe(await read($, rutas), e.subagentType).modelo
+    const started = await next(
+      modelo === HEREDAR || e.fork || e.workflow !== undefined ? e : { ...e, model: modelo },
+    )
+
+    if (started.agentId === undefined) {
+      return started
+    }
+
+    const id = started.agentId
+    const agente: Agente = {
+      id,
+      tipo: e.subagentType,
+      nombre: e.name ?? null,
+      descripcion: e.description,
+      modelo: started.model,
+      tarea: (await read($, tareas)).at(-1)?.n ?? 0,
+      inicio,
+      fin: null,
+      estado: 'en curso',
+      tokens: 0,
+      esfuerzo: null,
+      hereda: e.fork || e.workflow !== undefined,
+    }
+    await apuntar($, e.subagentType)
+    await update($, agentes, list =>
+      [...list.filter(one => one.id !== id), agente].slice(-MAX_AGENTES),
+    )
+    const antes = sueltos.get(id)
+
+    if (antes !== undefined) {
+      sueltos.delete(id)
+      await cambiar($, id, one => ({ ...one, tokens: one.tokens + antes }))
+    }
+
+    // Si ya está abierto no se toca: la persona puede estar en la otra pestaña.
+    if (
+      interactiva &&
+      !(await read($, oculto)) &&
+      !(await $.ui.panes()).some(pane => pane.id === PANEL)
+    ) {
+      abrir($).catch(() => undefined)
+    }
+
+    return started
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const id = e.agentId
+
+    if (id !== undefined) {
+      const fin = await $.clock.now()
+      const estado = e.reason === 'answer' ? 'ok' : e.reason === 'aborted' ? 'abortado' : 'error'
+      await cambiar($, id, agente => ({ ...agente, fin, estado }))
+    }
+
+    return next(e)
+  })
+
+  on('ui.close', { id: PANEL }, async ($, e, next) => {
+    if (e.origin.kind === 'person') {
+      await update($, oculto, () => true)
+    }
+
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANEL }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const actual = await read($, pestana)
+    const cuerpo = actual === 'enrutadores' ? await dibujarRutas($, e) : await dibujarAgentes($, e)
+
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" gap={1}>
+          {PESTANAS.map(({ id, titulo, tecla }) => (
+            <Button
+              key={`pestana:${id}`}
+              label={titulo}
+              hotkey={tecla}
+              variant={id === actual ? 'primary' : 'secondary'}
+              dimColor={id !== actual}
+              onPress={() => {
+                void update($, pestana, () => id)
+              }}
+            />
+          ))}
+        </Box>
+        <Text dimColor>{'─'.repeat(Math.max(1, e.props.bodyColumns))}</Text>
+        {cuerpo}
+      </Box>
+    )
+  })
+}
+
 export const register: Register = on => {
+  registrarAgentes(on)
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'tokens-compact',
@@ -413,6 +1029,7 @@ export const register: Register = on => {
     await cargar($)
     // Al recargar el mod a media sesión el motor ya los tiene.
     await limitar($, (await $.session.usage()).rateLimits)
+    await arrancarAgentes($)
     const started = await next(e)
 
     // Solo donde hay alguien mirando la banda.
@@ -472,16 +1089,18 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
-    const response = yield* next(e)
+    const sent = await enrutarPaso($, e)
+    const response = yield* next(sent)
     const usage = response.usage
+    await contarPaso($, sent, usage)
 
     if (usage) {
       const spent = gasto(usage)
       await update($, gastados, total => total + spent)
 
       if (e.agentId === undefined) {
-        const sent = enviado(usage)
-        await update($, contexto, () => sent)
+        const tokens = enviado(usage)
+        await update($, contexto, () => tokens)
       }
     }
 

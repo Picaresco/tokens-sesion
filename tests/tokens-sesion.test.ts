@@ -910,7 +910,7 @@ test('/tokens-compact enseña el umbral, lo cambia y lo guarda, y rechaza lo que
   const { ask, env, measure, registered, slash, start } = world($, on)
 
   await start()
-  expect(registered).toEqual(['tokens-compact'])
+  expect(registered).toEqual(['tokens-compact', 'agentes'])
   expect((await slash('')).text).toContain('al llegar el contexto a 650.000 tokens')
 
   // La banda cambia al momento, sin esperar a recargar.

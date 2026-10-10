@@ -1,8 +1,9 @@
-# tokens-sesion — mod de Claude Code
+# Plugin-Work — mod de Claude Code
 
 Una banda sobre el prompt que enseña **cuánto contexto llevas**, hace que la sesión
 **se compacte sola donde tú marques** (también a mitad de una tarea larga) y **guarda
-el resumen** de cada compactación.
+el resumen** de cada compactación. Y un **panel lateral con los subagentes** de cada
+tarea (inicio, fin y tokens) donde eliges **con qué modelo y esfuerzo** arranca cada tipo.
 
 ```
 Contexto: 222.807 tokens ████████●░░░░░░░░░░░░░░░░░┃░░░░░░░░░░░░░ · sesión: 2.431.870 · CPU 23% · RAM 61%
@@ -24,7 +25,7 @@ marca y archiva cada resumen en el proyecto.
 En el prompt de una sesión de Claude Code en el terminal:
 
 ```
-/plugin install tokens-sesion --marketplace Picaresco/tokens-sesion
+/plugin install tokens-sesion --marketplace Picaresco/Plugin-Work
 ```
 
 Responde `y` para añadir el marketplace y elige el ámbito (el de usuario lo deja
@@ -33,11 +34,12 @@ activo en todos tus proyectos). No hace falta reiniciar.
 Desde la línea de comandos, lo mismo en dos pasos:
 
 ```
-claude plugin marketplace add Picaresco/tokens-sesion
+claude plugin marketplace add Picaresco/Plugin-Work
 claude plugin install tokens-sesion@tokens-sesion
 ```
 
-Probado con Claude Code 2.1.293.
+El plugin se llama `tokens-sesion` (el nombre con el que nació, cuando solo era la banda);
+el repositorio, `Plugin-Work`. Probado con Claude Code 2.1.296.
 
 ## Qué enseña la banda
 
@@ -73,6 +75,45 @@ también actúa en tareas largas y con subagentes. El mod:
 El umbral va de 200.000 a 950.000 tokens (650.000 al instalar) y se guarda para
 todas tus sesiones y proyectos.
 
+## Panel de agentes
+
+Un panel lateral con dos pestañas, que se eligen con los botones de arriba (o con las
+teclas `1` y `2` cuando el panel tiene el teclado):
+
+```
+[ Agentes ]  [ Enrutadores ]
+────────────────────────────────────────────────
+Tarea 3 · 12:30:58 · 2 agentes · 21.520 tok
+busca los hooks del mod y revisa los tests
+✓ 12:31:05 → 12:32:47    1m42s    18.420 tok
+  Explore · buscar hooks · haiku-5-5 · low
+● 12:31:06 → en curso              3.100 tok
+  revisor (general-purpose) · revisar tests · opus-5-5
+```
+
+**Agentes** es el registro de los subagentes de la sesión, agrupados por tarea (cada
+prompt tuyo que lanza alguno), la más reciente arriba: hora de inicio, hora de fin,
+duración y tokens, que suben en vivo, con el total de la tarea. `●` en curso, `✓`
+terminado, `✗` abortado o con error. Los tokens se cuentan igual que `sesión:` en la banda.
+
+**Enrutadores** es una tabla con una fila por tipo de agente (los de Claude Code, los
+de tus plugins y los tuyos) y otra para «Los demás». En cada fila eliges el **modelo**
+(heredar, haiku, sonnet, opus, fable) y el **esfuerzo** (heredar, low, medium, high,
+xhigh, max) con el que arrancan los agentes de ese tipo. `[ Recomendados ]` pone una
+tabla de partida y `[ Todo heredar ]` lo deja como si no hubiera enrutado. Se aplica al
+momento y se guarda para todas tus sesiones y proyectos.
+
+- El modelo es un alias: lo resuelve Claude Code a su versión actual.
+- La tabla manda sobre el modelo que pida la llamada. Para una excepción, pon esa fila
+  en «heredar».
+- Un fork y los agentes de un workflow heredan siempre: Claude Code no deja cambiarlos.
+- El esfuerzo solo se cambia en los modelos que lo admiten.
+
+El panel se abre solo con el primer agente de la sesión si el terminal es ancho (desde
+144 columnas). Con `/agentes` se abre a cualquier ancho, `/agentes rutas` lo abre en
+Enrutadores, `/agentes cerrar` lo cierra y `/agentes limpiar` vacía el registro. Si lo
+cierras, no vuelve a abrirse solo hasta que lo pidas. El registro dura lo que la sesión.
+
 ## Qué toca en tu equipo
 
 - **Una variable de entorno del proceso**, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, solo
@@ -83,6 +124,8 @@ todas tus sesiones y proyectos.
   arrancar la sesión y, como mucho, cada 5 minutos: de ahí sale el límite semanal propio de cada
   modelo. Tarda unos 3 segundos, no llama al modelo, no carga tus plugins ni servidores MCP y no
   guarda sesión. Si tu plan no tiene límites por modelo, se hace una sola vez.
+- **El modelo y el esfuerzo de los subagentes**, solo de los tipos a los que se lo pongas en
+  la pestaña Enrutadores. Con todo en «heredar» (así viene) no cambia nada.
 - **Un `powershell.exe` oculto por sesión** (unos 85 MB) que lee el uso de CPU y RAM
   por WMI. Se cierra con la sesión. No sale nada del equipo: no hay red ni telemetría.
 
@@ -113,7 +156,8 @@ claude plugin marketplace remove tokens-sesion
 
 ## Desarrollo
 
-Es un plugin de *function hooks*: `hooks/register.tsx` es el módulo, `hooks/barra.tsx`
+Es un plugin de *function hooks*: `hooks/register.tsx` es el módulo (la banda y el panel
+de agentes: Claude Code carga un solo módulo por plugin), `hooks/barra.tsx`
 la barra que recibe el ratón y `types/index.d.ts` el contrato de su estado.
 
 ```
