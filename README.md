@@ -1,5 +1,7 @@
 # Plugin-Work — mod de Claude Code
 
+https://github.com/user-attachments/assets/3415bdc9-af88-4edb-8322-df0dacd57ba5
+
 Un plugin para **ver y controlar lo que pasa en una sesión larga de Claude Code**: cuánto
 contexto llevas, cuánto gastas, qué hacen los subagentes, por dónde va el plan de trabajo y
 qué queda registrado cuando la sesión se cierra.
